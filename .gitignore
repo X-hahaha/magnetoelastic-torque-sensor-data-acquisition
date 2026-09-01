@@ -1,0 +1,77 @@
+# Vivado generated files
+.Xil/
+*.jou
+*.log
+*.str
+*.tmp
+*.backup
+*.bak
+
+*.runs/
+*.cache/
+*.hw/
+*.gen/
+*.sim/
+*.ip_user_files/
+
+# Vivado outputs
+*.bit
+*.bin
+*.ltx
+*.mcs
+*.mmi
+*.rpt
+*.rpx
+*.dcp
+*.hwdef
+*.hdf
+*.xsa
+*.sysdef
+*.vdi
+*.pb
+*.wdb
+*.wcfg
+
+# SDK / Eclipse generated files
+.metadata/
+Debug/
+Release/
+*.elf
+*.o
+*.d
+*.map
+*.bif
+*.pdom
+*.sc
+
+# Python
+__pycache__/
+*.pyc
+
+# Data logs
+data/raw/
+*.csv
+!data/example/*.csv
+log/
+
+# Runtime capture data (采集波形数据，体积大，不入库)
+software/captures/
+
+# 临时遗留文件夹
+新建文件夹/
+
+# Vivado Block Design generated IP outputs (可由 bd.tcl / xpr 重建)
+DS_system/DS_system.srcs/sources_1/bd/ps_system/ip/
+DS_system/DS_system.srcs/sources_1/bd/ps_system/ipshared/
+
+# SDK BSP / hw platform / logs (SDK 可自动重新生成)
+DS_system/DS_system.sdk/DS_System_PS_bsp/
+DS_system/DS_system.sdk/ps_system_wrapper_hw_platform_1/
+DS_system/DS_system.sdk/webtalk/
+DS_system/DS_system.sdk/RemoteSystemsTempFiles/
+DS_system/DS_system.sdk/SDK.log
+DS_system/DS_system.sdk/ps_system_wrapper.hdf
+
+# OS
+.DS_Store
+Thumbs.db

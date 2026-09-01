@@ -1,0 +1,56 @@
+M2 refactor validation report
+==============================
+
+Completed source-level checks:
+
+1. FR16 fixed geometry
+   frame_bytes      = 8192
+   header_bytes     = 256
+   sample_count     = 1562/channel
+   waveform_bytes   = 6248
+   summary_offset   = 6504
+   summary_bytes    = 128
+   footer_offset    = 8152
+   footer_bytes     = 40
+   payload_bytes    = 6672
+
+2. Reference binary record
+   - header/footer magic and all offsets checked
+   - A/B waveform interpreted as signed int16
+   - summary raw pp equals max(waveform)-min(waveform)
+
+3. Packer timing model, TREADY continuously asserted
+   - 3610 cycles at 50 MHz
+   - 72.20 us from capture_done to footer/TLAST
+   - 27.80 us margin before the next 200 us trigger
+   - 127.80 us margin before the next capture completion
+
+4. Source/project checks
+   - M2 packer is present and instantiated
+   - fixed completed BRAM bank read path is present
+   - XPR includes fr16_adc_frame_axis.v
+   - ps_system.bd parses as JSON
+   - DS_system.xpr parses as XML
+   - c_sg_include_stscntrl_strm = 0
+   - c_sg_use_stsapp_length = 0
+   - mode-changing M1 commands are removed
+   - Tcl script is syntactically complete
+   - basic Verilog module/begin/case/function balance checks pass
+
+5. PS software
+   - echo.c passes host gcc -fsyntax-only with the project BSP headers
+   - format-string checking enabled (-Wformat=2)
+   - compile-time FR16 header/footer size guards pass
+
+Commands used:
+   tools/run_m2_static_checks.sh
+
+Not performed in this environment:
+   - Vivado 2018.3 elaboration/synthesis/implementation/timing
+   - XSim execution of tb_fr16_adc_frame_axis.sv
+   - bitstream generation
+   - Zynq-7020 hardware test
+   - 10-minute 5000 frame/s soak test
+
+Therefore the source refactor is complete, but M2 cannot be declared hardware-
+accepted until the board logs satisfy the criteria in M2_REFACTOR_NOTES.md.
