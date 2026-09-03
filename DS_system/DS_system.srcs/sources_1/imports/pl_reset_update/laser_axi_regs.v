@@ -7,6 +7,13 @@
 //   0x38 read : command/status scratch.
 //   0x3C read : PL debug status from pl_capture_logic.
 //
+// Runtime waveform length:
+//   0x24 read/write: sample_count_cfg in samples per channel. Reset default is
+//   DEFAULT_SAMPLE_COUNT (manual long frame). PS shortens it for auto mode.
+//   Writes outside [MIN_SAMPLE_COUNT, DEFAULT_SAMPLE_COUNT] are ignored.
+//   Change only while no capture is active; the frame packer latches the value
+//   at capture start.
+//
 // The ADC BRAM read port is driven by adc_sample_rd_en/addr, and the returned
 // adc_sample_rd_data is latched internally after a few S_AXI_ACLK cycles.
 //
@@ -70,6 +77,9 @@ module laser_axi_regs #(
     output reg  [ADC_ADDR_WIDTH-1:0]         adc_sample_rd_addr,
     input  wire [31:0]                       adc_sample_rd_data,
 
+    // Runtime waveform length for the frame packer (samples per channel).
+    output reg  [31:0]                       sample_count_cfg,
+
     // Active-high PL soft reset hold. Asserted/deasserted by PS writes to REG_WORD_MAGIC.
     output reg                               pl_soft_reset_hold
 );
@@ -83,7 +93,7 @@ module laser_axi_regs #(
     localparam [3:0] REG_WORD_LASER5         = 4'h6;  // 0x18
     localparam [3:0] REG_WORD_TEMP           = 4'h7;  // 0x1C
     localparam [3:0] REG_WORD_STATUS         = 4'h8;  // 0x20
-    localparam [3:0] REG_WORD_PERIOD         = 4'h9;  // 0x24
+    localparam [3:0] REG_WORD_SAMPLE_COUNT   = 4'h9;  // 0x24 read/write runtime waveform length
     localparam [3:0] REG_WORD_ADC_A_RAW_PP   = 4'hA;  // 0x28
     localparam [3:0] REG_WORD_ADC_B_RAW_PP   = 4'hB;  // 0x2C
     localparam [3:0] REG_WORD_ADC_A_FILT_PP  = 4'hC;  // 0x30
@@ -94,6 +104,8 @@ module laser_axi_regs #(
     localparam [31:0] PL_RESET_ASSERT_WORD   = 32'hA55A0001;
     localparam [31:0] PL_RESET_RELEASE_WORD  = 32'h00000000;
     localparam [31:0] CAPTURE_START_WORD     = 32'hCACE0001;
+    localparam [31:0] DEFAULT_SAMPLE_COUNT   = 32'd4687500; // 0.3 s @ 15.625 MHz
+    localparam [31:0] MIN_SAMPLE_COUNT       = 32'd16;      // moving-average filter length
 
     reg [C_S_AXI_ADDR_WIDTH-1:0] araddr_reg;
 
@@ -123,7 +135,7 @@ module laser_axi_regs #(
                 REG_WORD_LASER5:        read_mux = laser5_um;
                 REG_WORD_TEMP:          read_mux = {{16{temperature_x10[15]}}, temperature_x10};
                 REG_WORD_STATUS:        read_mux = status_word;
-                REG_WORD_PERIOD:        read_mux = 32'd0; // host-triggered capture, no automatic period
+                REG_WORD_SAMPLE_COUNT:  read_mux = sample_count_cfg;
                 REG_WORD_ADC_A_RAW_PP:  read_mux = adc_a_raw_pp;
                 REG_WORD_ADC_B_RAW_PP:  read_mux = adc_b_raw_pp;
                 REG_WORD_ADC_A_FILT_PP: read_mux = adc_a_filt_pp;
@@ -169,6 +181,7 @@ module laser_axi_regs #(
             adc_sample_rd_addr       <= {ADC_ADDR_WIDTH{1'b0}};
             adc_sample_addr_latched  <= {ADC_ADDR_WIDTH{1'b0}};
             capture_cmd_count        <= 32'd0;
+            sample_count_cfg         <= DEFAULT_SAMPLE_COUNT;
             pl_soft_reset_hold       <= 1'b1;
         end else begin
             S_AXI_AWREADY    <= 1'b0;
@@ -193,6 +206,11 @@ module laser_axi_regs #(
                     if (S_AXI_WDATA == CAPTURE_START_WORD) begin
                         adc_sample_rd_en <= 1'b1;
                         capture_cmd_count <= capture_cmd_count + 1'b1;
+                    end
+                end else if (S_AXI_AWADDR[5:2] == REG_WORD_SAMPLE_COUNT) begin
+                    if ((S_AXI_WDATA >= MIN_SAMPLE_COUNT) &&
+                        (S_AXI_WDATA <= DEFAULT_SAMPLE_COUNT)) begin
+                        sample_count_cfg <= S_AXI_WDATA;
                     end
                 end
             end else if (S_AXI_BVALID && S_AXI_BREADY) begin

@@ -67,13 +67,31 @@ GUI 默认参数和命令行版一致：
 
 界面主要区域：
 
-- 顶部连接/命令栏：可修改板端 IP、本地绑定地址、端口和输出目录；支持 `Ping`、`DMA_STATUS`、`CAL_STATUS`、`CAL_START`、自定义 ASCII 命令和“采集一帧”。
-- 左侧采集信息：显示当前帧号、WV32/LS32 收包进度、样点/激光记录数、summary 是否收到、缺包数量、收包统计和输出路径。
+- 顶部连接/命令栏：可修改板端 IP、本地绑定IP、端口和输出目录；支持 `Ping`、`DMA_STATUS`、`CAL_STATUS`、`CAL_START`、自定义 ASCII 命令和“采集一帧”。
+- 左侧采集信息：手动和自动模式共用，显示模式、当前帧号、记录耗时、WV32收包进度、summary、缺包数量、收包统计和输出路径；自动模式不回传LS32，因此对应字段显示“自动模式不回传”。
 - 左侧校准信息：显示 `cal_state`、`cal_valid`、A/B 增益、零点残差和 `me_norm_ppm`。
 - 中间波形预览：采集完成后对 4,687,500 点/通道的原始 16bit 数据按有符号 `int16` 抽样显示，蓝色为 ADC A，红色为 ADC B。
 - 底部页签：`网口 Log` 显示命令和板端文本回复；`Summary` 显示本帧 summary 字段；`激光/温度时间线` 显示本帧内的 LS32 记录。
 
 GUI 在采集过程中会禁用命令按钮，直到本帧完成并落盘后才允许再次发起采集，避免上位机重复发送 `CAPTURE`。
+
+### GUI 自动模式
+
+自动模式参数与板端约束一致：转速 `1~4000 rpm`，阈值为有符号 32 位微米值，点数为 `16~4,687,500`。界面按钮含义如下：
+
+- `启动自动`：把当前三个输入框参数随 `AUTO_START` 一次性发送；之后只修改输入框不会自动下发。
+- `应用参数`：发送 `AUTO_CFG`，用于更新已运行的自动模式，或者设置下一次自动启动的预设值。
+- `启动并记录`：推荐的实验入口。上位机先绑定 UDP 50010，再发送 `AUTO_START`，避免自动模式启动后、记录线程建立前丢失首批帧。
+- `仅开始记录`：只被动接收当前已经运行的自动模式，不修改板端参数，也不启动自动模式。
+- `停止记录`：只停止上位机落盘；板端自动模式仍然运行，需要再点击 `停止自动` 才会发送 `AUTO_STOP`。
+
+自动连续记录目录为 `auto_log_YYYYMMDD_HHMMSS/`，包含：
+
+- `summary.csv`：所有收到的板端 summary。
+- `wave_interleaved_a_b_u16le.bin`：本次记录中所有完整帧共用的一个二进制波形文件，按帧完成落盘的顺序连续追加。每个样点依次为小端 `uint16 ADC_A + uint16 ADC_B`，即每个样点 4 字节；按 AD9268 二进制补码解释时可读作两个小端 `int16`。
+- `integrity.csv`：逐帧记录期望/实收分包数、缺包编号、重复包、坏包及结束原因。完整帧通过 `wave_file`、`wave_byte_offset`、`wave_bytes` 和 `wave_total_samples` 标出它在上述二进制文件中的位置；UDP 缺包帧不写入波形文件，这些字段留空。
+
+一帧波形可按以下方式从聚合文件中取出：从 `wave_byte_offset` 开始读取 `wave_bytes` 字节，再按 `<i2` 的 `ADC_A, ADC_B` 交织顺序解释。帧在文件中的顺序以 `integrity.csv` 记录为准，不应直接用帧号或行号推算偏移量。
 
 ## MATLAB 绘图
 
@@ -143,4 +161,4 @@ plot_capture_frame("captures/capture_20260808_150309/frame_000032_wave_interleav
 - 上位机必须绑定本地 UDP `50010`，板端只向这个端口发数据。
 - 一帧波形约 18.75 MB，加上少量激光时间线和 metadata。
 - 如果 `metadata.json` 中 `missing_chunks` 非空，说明 UDP 包丢失，本脚本不会重传。
-- GUI 和命令行版都会保存同样的原始波形、激光时间线、summary 和 metadata 文件。
+- GUI 手动采集和命令行版仍按帧保存波形、时间线、summary 和 metadata；GUI 自动连续记录则以每次“开始记录”为一个目录，使用聚合的 `summary.csv`、`integrity.csv` 和单个 `wave_interleaved_a_b_u16le.bin`。

@@ -2,21 +2,24 @@
 """
 Tkinter GUI for the DS_system_02ms UDP host.
 
-The GUI keeps the same transaction rule as ds_host.py: one CAPTURE command is
-allowed at a time, and the next capture is disabled until the current frame has
-been received and written to disk.
+Manual mode keeps the same one-CAPTURE-at-a-time transaction rule as ds_host.py.
+Auto mode can bind the receive socket before AUTO_START, reassembles concurrent
+frame IDs independently, and records per-frame UDP integrity before accepting a
+waveform as experiment data.
 """
 
 from __future__ import annotations
 
+import csv
 import os
 import queue
 import socket
 import struct
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, TextIO, Tuple
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -32,8 +35,11 @@ from ds_host import (
     LS32_RECORD_BYTES,
     SUMMARY_COLUMNS,
     TIMELINE_COLUMNS,
+    WAVE_HEADER_BYTES,
     WV32_MAGIC,
+    is_summary_row,
     now_stamp,
+    parse_summary_row,
     parse_text_datagram,
 )
 
@@ -43,6 +49,32 @@ DEFAULT_OUTPUT_ROOT = SOFTWARE_DIR / "captures"
 DEFAULT_RECV_BUFFER = 64 * 1024 * 1024
 DEFAULT_TIMEOUT_S = 25.0
 DEFAULT_SUMMARY_GRACE_S = 0.8
+AUTO_MIN_RPM = 1
+AUTO_MAX_RPM = 4000
+AUTO_MIN_POINTS = 16
+AUTO_MAX_POINTS = ADC_SAMPLE_COUNT
+AUTO_FRAME_STALE_S = 2.0
+
+STREAM_INTEGRITY_COLUMNS = [
+    "frame_id",
+    "complete",
+    "wave_saved",
+    "wave_file",
+    "wave_byte_offset",
+    "wave_bytes",
+    "finalize_reason",
+    "summary_received",
+    "wave_received_chunks",
+    "wave_total_chunks",
+    "wave_received_samples",
+    "wave_total_samples",
+    "missing_wave_count",
+    "missing_wave_chunks",
+    "duplicate_wave_chunks",
+    "bad_wave_packets",
+    "unassigned_bad_datagrams",
+    "elapsed_s",
+]
 
 CAL_STATE_NAMES = {
     "0": "IDLE",
@@ -105,6 +137,17 @@ def summary_value(summary: Dict[str, str], key: str) -> str:
     if key == "cal_valid":
         return fmt_bool(value)
     return value if value else "-"
+
+
+def unique_output_dir(root: Path, prefix: str) -> Path:
+    base = root / f"{prefix}_{now_stamp()}"
+    if not base.exists():
+        return base
+    for suffix in range(1, 1000):
+        candidate = root / f"{base.name}_{suffix:02d}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"无法为 {base} 分配唯一输出目录")
 
 
 def parse_hash_kv_line(line: str) -> Tuple[str, Dict[str, str]]:
@@ -189,6 +232,312 @@ def make_wave_preview(
     return points, min_v, max_v
 
 
+@dataclass(frozen=True)
+class AutoConfig:
+    rpm: int
+    threshold_um: int
+    points: int
+
+    def command(self, prefix: str) -> str:
+        return f"{prefix},{self.rpm},{self.threshold_um},{self.points}"
+
+
+def parse_auto_config(rpm_text: str, threshold_text: str, points_text: str) -> AutoConfig:
+    try:
+        rpm = int(rpm_text.strip())
+        threshold_um = int(threshold_text.strip())
+        points = int(points_text.strip())
+    except ValueError as exc:
+        raise ValueError("转速、阈值和点数必须是整数") from exc
+
+    if not AUTO_MIN_RPM <= rpm <= AUTO_MAX_RPM:
+        raise ValueError(f"转速必须在 {AUTO_MIN_RPM} 到 {AUTO_MAX_RPM} rpm 之间")
+    if not -(2**31) <= threshold_um < 2**31:
+        raise ValueError("阈值必须在有符号 32 位整数范围内")
+    if not AUTO_MIN_POINTS <= points <= AUTO_MAX_POINTS:
+        raise ValueError(
+            f"点数必须在 {AUTO_MIN_POINTS} 到 {AUTO_MAX_POINTS:,} 之间"
+        )
+    return AutoConfig(rpm=rpm, threshold_um=threshold_um, points=points)
+
+
+@dataclass(frozen=True)
+class WavePacket:
+    frame_id: int
+    chunk_index: int
+    total_chunks: int
+    start_sample: int
+    sample_count: int
+    total_samples: int
+    payload: bytes
+
+
+def parse_wave_packet(data: bytes) -> WavePacket:
+    if len(data) < WAVE_HEADER_BYTES or data[:4] != WV32_MAGIC:
+        raise ValueError("WV32 header is missing")
+    if data[4] != 1 or data[5] != WAVE_HEADER_BYTES:
+        raise ValueError("WV32 version/header length mismatch")
+
+    frame_id, chunk_index, total_chunks, start_sample, sample_count, total_samples = (
+        struct.unpack_from("<IIIIII", data, 8)
+    )
+    payload = data[WAVE_HEADER_BYTES:]
+    if total_chunks == 0 or chunk_index >= total_chunks:
+        raise ValueError("WV32 chunk index is outside the advertised range")
+    if not AUTO_MIN_POINTS <= total_samples <= AUTO_MAX_POINTS:
+        raise ValueError("WV32 total sample count is outside the firmware range")
+    if sample_count == 0 or start_sample + sample_count > total_samples:
+        raise ValueError("WV32 sample range is invalid")
+    if len(payload) != sample_count * 4:
+        raise ValueError("WV32 payload length mismatch")
+    return WavePacket(
+        frame_id=frame_id,
+        chunk_index=chunk_index,
+        total_chunks=total_chunks,
+        start_sample=start_sample,
+        sample_count=sample_count,
+        total_samples=total_samples,
+        payload=payload,
+    )
+
+
+@dataclass
+class AutoFrameAssembly:
+    frame: CaptureFrame
+    first_seen_monotonic: float
+    last_seen_monotonic: float
+    summary_seen_monotonic: Optional[float] = None
+    wave_ranges: Dict[int, Tuple[int, int]] = field(default_factory=dict)
+
+    @property
+    def received_samples(self) -> int:
+        return sum(count for _start, count in self.wave_ranges.values())
+
+    def waveform_complete(self) -> bool:
+        frame = self.frame
+        if (
+            frame.wave_total_chunks is None
+            or frame.wave_total_samples is None
+            or len(frame.wave_received) != frame.wave_total_chunks
+            or len(self.wave_ranges) != frame.wave_total_chunks
+        ):
+            return False
+
+        cursor = 0
+        for start, count in sorted(self.wave_ranges.values()):
+            if start != cursor:
+                return False
+            cursor += count
+        return cursor == frame.wave_total_samples
+
+    def complete(self) -> bool:
+        return self.frame.summary_received and self.waveform_complete()
+
+
+class AutoStreamRecorder:
+    """Reassemble, validate and persist auto-mode frames.
+
+    summary.csv retains the established experiment format. All complete
+    waveforms in one recording session are appended to one interleaved
+    little-endian binary file. integrity.csv records each frame's byte range and
+    explains why incomplete frames were omitted from the binary stream.
+    """
+
+    def __init__(
+        self,
+        output_dir: Path,
+        emit: Callable[..., None],
+        summary_grace_s: float,
+    ) -> None:
+        self.output_dir = output_dir
+        self.emit = emit
+        self.summary_grace_s = summary_grace_s
+        self.stale_s = max(AUTO_FRAME_STALE_S, summary_grace_s * 2.0)
+        self.frames: Dict[int, AutoFrameAssembly] = {}
+        self.finalized_ids: set[int] = set()
+        self.finalized_count = 0
+        self.complete_count = 0
+        self.incomplete_count = 0
+        self.bad_datagrams = 0
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self.summary_file: TextIO = (output_dir / "summary.csv").open(
+            "w", newline="", encoding="utf-8"
+        )
+        self.integrity_file: TextIO = (output_dir / "integrity.csv").open(
+            "w", newline="", encoding="utf-8"
+        )
+        self.wave_path = output_dir / "wave_interleaved_a_b_u16le.bin"
+        self.wave_file = self.wave_path.open("wb")
+        self.summary_writer = csv.writer(self.summary_file)
+        self.integrity_writer = csv.writer(self.integrity_file)
+        self.summary_writer.writerow(SUMMARY_COLUMNS)
+        self.integrity_writer.writerow(STREAM_INTEGRITY_COLUMNS)
+
+    def _assembly(self, frame_id: int, now: float) -> Optional[AutoFrameAssembly]:
+        if frame_id in self.finalized_ids:
+            self.emit("log", message=f"#HOST,late_packet,frame={frame_id}")
+            return None
+        assembly = self.frames.get(frame_id)
+        if assembly is None:
+            assembly = AutoFrameAssembly(
+                frame=CaptureFrame(output_dir=self.output_dir),
+                first_seen_monotonic=now,
+                last_seen_monotonic=now,
+            )
+            self.frames[frame_id] = assembly
+        else:
+            assembly.last_seen_monotonic = now
+        return assembly
+
+    def accept_wave(self, data: bytes) -> None:
+        try:
+            packet = parse_wave_packet(data)
+        except (ValueError, struct.error) as exc:
+            self.bad_datagrams += 1
+            self.emit("log", message=f"#HOST,bad_wv32,reason={exc}")
+            return
+
+        now = time.monotonic()
+        assembly = self._assembly(packet.frame_id, now)
+        if assembly is None:
+            return
+        before = len(assembly.frame.wave_received)
+        assembly.frame.accept_wave(data)
+        if len(assembly.frame.wave_received) == before:
+            return
+
+        assembly.wave_ranges[packet.chunk_index] = (
+            packet.start_sample,
+            packet.sample_count,
+        )
+        self.emit(
+            "stream_wave",
+            frame_id=packet.frame_id,
+            start_sample=packet.start_sample,
+            total_samples=packet.total_samples,
+            payload=packet.payload,
+            received_chunks=len(assembly.frame.wave_received),
+            total_chunks=assembly.frame.wave_total_chunks,
+            received_samples=assembly.received_samples,
+        )
+        if assembly.complete():
+            self._finalize(packet.frame_id, "complete")
+
+    def accept_summary(self, line: str) -> bool:
+        if not is_summary_row(line):
+            return False
+        parsed = parse_summary_row(line)
+        try:
+            frame_id = int(parsed.get("frame_id", ""), 10)
+        except ValueError:
+            return False
+
+        now = time.monotonic()
+        assembly = self._assembly(frame_id, now)
+        if assembly is None:
+            return True
+        assembly.frame.accept_text(line)
+        assembly.summary_seen_monotonic = now
+        if assembly.complete():
+            self._finalize(frame_id, "complete")
+        return True
+
+    def sweep(self) -> None:
+        now = time.monotonic()
+        for frame_id, assembly in list(self.frames.items()):
+            if assembly.complete():
+                self._finalize(frame_id, "complete")
+            elif (
+                assembly.summary_seen_monotonic is not None
+                and now - assembly.summary_seen_monotonic >= self.summary_grace_s
+            ):
+                self._finalize(frame_id, "summary_grace_expired")
+            elif now - assembly.last_seen_monotonic >= self.stale_s:
+                self._finalize(frame_id, "packet_timeout")
+
+    def _finalize(self, frame_id: int, reason: str) -> None:
+        assembly = self.frames.pop(frame_id, None)
+        if assembly is None:
+            return
+        frame = assembly.frame
+        frame.end_time = time.time()
+        complete = assembly.complete()
+        missing = frame.missing_wave_chunks()
+        wave_saved = complete and frame.wave_bytes is not None
+        wave_byte_offset: Optional[int] = None
+        wave_byte_count = 0
+
+        if frame.summary_received:
+            self.summary_writer.writerow(
+                [frame.summary.get(name, "") for name in SUMMARY_COLUMNS]
+            )
+            self.summary_file.flush()
+        if wave_saved:
+            wave_byte_offset, wave_byte_count = self._append_wave_binary(
+                frame.wave_bytes or bytearray()
+            )
+
+        self.integrity_writer.writerow(
+            [
+                frame_id,
+                int(complete),
+                int(wave_saved),
+                self.wave_path.name if wave_saved else "",
+                wave_byte_offset if wave_byte_offset is not None else "",
+                wave_byte_count if wave_saved else "",
+                reason,
+                int(frame.summary_received),
+                len(frame.wave_received),
+                frame.wave_total_chunks if frame.wave_total_chunks is not None else "",
+                assembly.received_samples,
+                frame.wave_total_samples if frame.wave_total_samples is not None else "",
+                len(missing) if frame.wave_total_chunks is not None else "",
+                ";".join(str(index) for index in missing),
+                frame.stats.wave_duplicates,
+                frame.stats.wave_bad_packets,
+                self.bad_datagrams,
+                f"{frame.end_time - frame.start_time:.6f}",
+            ]
+        )
+        self.integrity_file.flush()
+
+        self.finalized_ids.add(frame_id)
+        self.finalized_count += 1
+        if complete:
+            self.complete_count += 1
+        else:
+            self.incomplete_count += 1
+        self.emit(
+            "stream_frame_done",
+            frame_id=frame_id,
+            summary=frame.summary,
+            complete=complete,
+            reason=reason,
+            received_chunks=len(frame.wave_received),
+            total_chunks=frame.wave_total_chunks,
+            received_samples=assembly.received_samples,
+            total_samples=frame.wave_total_samples,
+            missing_chunks=len(missing) if frame.wave_total_chunks is not None else None,
+            finalized=self.finalized_count,
+            complete_frames=self.complete_count,
+            incomplete_frames=self.incomplete_count,
+            bad_datagrams=self.bad_datagrams,
+        )
+
+    def _append_wave_binary(self, wave_bytes: bytearray) -> Tuple[int, int]:
+        offset = self.wave_file.tell()
+        self.wave_file.write(wave_bytes)
+        self.wave_file.flush()
+        return offset, len(wave_bytes)
+
+    def close(self, reason: str = "stream_stopped") -> None:
+        for frame_id in list(self.frames):
+            self._finalize(frame_id, reason)
+        for handle in (self.summary_file, self.integrity_file, self.wave_file):
+            handle.close()
+
+
 class UdpWorker:
     def __init__(
         self,
@@ -248,12 +597,39 @@ class UdpWorker:
                     self.emit("log", message=clean)
         return lines
 
-    def run_command(self, command: str, wait_s: float = 1.0) -> None:
+    def run_command(
+        self,
+        command: str,
+        wait_s: float = 1.0,
+        stop_on_first_reply: bool = False,
+    ) -> None:
         sock: Optional[socket.socket] = None
         try:
             sock = self.open_socket()
             self.send_command(sock, command)
-            lines = self.drain_text(sock, wait_s)
+            if stop_on_first_reply:
+                lines: List[str] = []
+                deadline = time.monotonic() + wait_s
+                while time.monotonic() < deadline:
+                    try:
+                        data, _addr = sock.recvfrom(65535)
+                    except socket.timeout:
+                        continue
+                    text = parse_text_datagram(data)
+                    if text is None:
+                        # Do not keep consuming auto-mode waveform packets while
+                        # this short transaction is waiting for its ACK.
+                        self.emit(
+                            "log",
+                            message=f"#HOST,command_received_binary,len={len(data)}",
+                        )
+                        break
+                    lines = [line.strip() for line in text.splitlines() if line.strip()]
+                    for line in lines:
+                        self.emit("log", message=line)
+                    break
+            else:
+                lines = self.drain_text(sock, wait_s)
             self.emit("command_done", command=command, lines=lines)
         except Exception as exc:
             self.emit("error", title="命令失败", message=str(exc))
@@ -262,10 +638,101 @@ class UdpWorker:
                 sock.close()
 
     def run_capture(self) -> None:
+        self._run_capture_impl()
+
+    def run_auto_stream(
+        self,
+        stop_event: threading.Event,
+        out_dir: Path,
+        startup_command: Optional[str] = None,
+    ) -> None:
+        """Receive and persist auto frames until stop_event is set.
+
+        If startup_command is supplied, the receive socket is bound before
+        AUTO_START is sent, so the first automatically triggered frame cannot
+        be lost between two short-lived GUI workers.
+        """
+        sock: Optional[socket.socket] = None
+        recorder: Optional[AutoStreamRecorder] = None
+        failure: Optional[Exception] = None
+        startup_pending = startup_command is not None
+        startup_deadline = time.monotonic() + 2.0 if startup_pending else None
+        try:
+            sock = self.open_socket()
+            recorder = AutoStreamRecorder(out_dir, self.emit, self.summary_grace_s)
+            self.emit("log", message=f"#HOST,auto_stream_start,dir={out_dir}")
+            if startup_command is not None:
+                self.send_command(sock, startup_command)
+
+            while not stop_event.is_set():
+                try:
+                    data, _addr = sock.recvfrom(65535)
+                except socket.timeout:
+                    recorder.sweep()
+                    if (
+                        startup_pending
+                        and startup_deadline is not None
+                        and time.monotonic() >= startup_deadline
+                    ):
+                        raise RuntimeError("启动自动模式超时：未收到板端回复")
+                    continue
+                except OSError:
+                    if stop_event.is_set():
+                        break
+                    raise
+
+                if data.startswith(WV32_MAGIC):
+                    startup_pending = False
+                    recorder.accept_wave(data)
+                elif data.startswith(LS32_MAGIC):
+                    continue  # auto mode does not send LS32
+                else:
+                    text = parse_text_datagram(data)
+                    if text is None:
+                        continue
+                    for line in text.splitlines():
+                        clean = line.strip()
+                        if not clean or clean.startswith("#CAPTURE"):
+                            continue  # suppress per-frame trigger spam
+                        if recorder.accept_summary(clean):
+                            startup_pending = False
+                            continue
+                        self.emit("log", message=clean)
+                        if startup_pending:
+                            if clean.startswith(("#ERR", "#BUSY")):
+                                raise RuntimeError(f"启动自动模式失败：{clean}")
+                            if clean.startswith("#AUTO,STARTED"):
+                                startup_pending = False
+                recorder.sweep()
+
+        except Exception as exc:
+            failure = exc
+        finally:
+            if recorder is not None:
+                try:
+                    recorder.close("stream_stopped" if failure is None else "stream_error")
+                except Exception as exc:
+                    if failure is None:
+                        failure = exc
+            if sock is not None:
+                sock.close()
+            if failure is not None:
+                self.emit("error", title="连续记录失败", message=str(failure))
+            else:
+                self.emit(
+                    "stream_done",
+                    frames=recorder.finalized_count if recorder is not None else 0,
+                    complete_frames=recorder.complete_count if recorder is not None else 0,
+                    incomplete_frames=recorder.incomplete_count if recorder is not None else 0,
+                    bad_datagrams=recorder.bad_datagrams if recorder is not None else 0,
+                    output_dir=out_dir,
+                )
+
+    def _run_capture_impl(self) -> None:
         sock: Optional[socket.socket] = None
         frame: Optional[CaptureFrame] = None
         try:
-            capture_dir = self.output_root / f"capture_{now_stamp()}"
+            capture_dir = unique_output_dir(self.output_root, "capture")
             frame = CaptureFrame(output_dir=capture_dir)
             sock = self.open_socket()
 
@@ -372,6 +839,14 @@ class DSHostGui(tk.Tk):
 
         self.events: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self.busy = False
+        self.streaming = False
+        self.stream_stop_event: Optional[threading.Event] = None
+        self.stream_started_monotonic: Optional[float] = None
+        # Live auto-mode wave view: payloads are placed at their sample offset
+        # as WV32 packets arrive and redrawn throttled (~20 fps).
+        self.stream_wave_buf: Optional[bytearray] = None
+        self.stream_wave_fid: Optional[int] = None
+        self.stream_wave_dirty = False
         self.current_frame: Optional[CaptureFrame] = None
         self.wave_points: List[Tuple[int, int, int]] = []
         self.wave_min = 0
@@ -387,7 +862,23 @@ class DSHostGui(tk.Tk):
         self.preview_points_var = tk.StringVar(value="1600")
         self.worker_state_var = tk.StringVar(value="空闲")
 
+        # Auto acquisition mode controls (defaults match firmware presets).
+        self.auto_rpm_var = tk.StringVar(value="1000")
+        self.auto_thr_var = tk.StringVar(value="32000")
+        self.auto_points_var = tk.StringVar(value="3125")
+        self.auto_vars: Dict[str, tk.StringVar] = {
+            "active": tk.StringVar(value="-"),
+            "rpm": tk.StringVar(value="-"),
+            "t_speed_ms": tk.StringVar(value="-"),
+            "thr_um": tk.StringVar(value="-"),
+            "points": tk.StringVar(value="-"),
+            "t_idle_ms": tk.StringVar(value="-"),
+            "last_l2_um": tk.StringVar(value="-"),
+            "triggers": tk.StringVar(value="-"),
+        }
+
         self.info_vars: Dict[str, tk.StringVar] = {
+            "mode": tk.StringVar(value="-"),
             "frame_id": tk.StringVar(value="-"),
             "elapsed": tk.StringVar(value="-"),
             "wave_chunks": tk.StringVar(value="0/?"),
@@ -431,6 +922,7 @@ class DSHostGui(tk.Tk):
         self.buttons: List[ttk.Button] = []
         self._build_style()
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(80, self._poll_events)
 
     def _build_style(self) -> None:
@@ -526,6 +1018,50 @@ class DSHostGui(tk.Tk):
         )
         ttk.Button(row2, text="清空日志", command=self._clear_log).pack(side=tk.RIGHT)
 
+        row3 = ttk.Frame(bar)
+        row3.grid(row=2, column=0, columnspan=12, sticky="ew", pady=(6, 0))
+
+        ttk.Label(row3, text="自动模式", style="Title.TLabel").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(row3, text="转速 rpm").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Entry(row3, textvariable=self.auto_rpm_var, width=7).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(row3, text="阈值 um").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Entry(row3, textvariable=self.auto_thr_var, width=8).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(row3, text="点数").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Entry(row3, textvariable=self.auto_points_var, width=8).pack(side=tk.LEFT, padx=(0, 8))
+
+        for text, command in (
+            ("启动自动", self._start_auto),
+            ("应用参数", self._apply_auto_config),
+            ("停止自动", lambda: self._start_command("AUTO_STOP", 1.2, True)),
+            ("自动状态", lambda: self._start_command("AUTO_STATUS", 1.2, True)),
+        ):
+            btn = ttk.Button(row3, text=text, command=command)
+            btn.pack(side=tk.LEFT, padx=(0, 6))
+            self.buttons.append(btn)
+
+        start_and_stream_btn = ttk.Button(
+            row3,
+            text="启动并记录",
+            style="Primary.TButton",
+            command=lambda: self._start_auto_stream(start_auto=True),
+        )
+        start_and_stream_btn.pack(side=tk.LEFT, padx=(10, 6))
+        self.buttons.append(start_and_stream_btn)
+
+        stream_start_btn = ttk.Button(
+            row3,
+            text="仅开始记录",
+            command=lambda: self._start_auto_stream(start_auto=False),
+        )
+        stream_start_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.buttons.append(stream_start_btn)
+        # Stop button is managed manually: it must stay clickable while the
+        # stream worker keeps the rest of the UI busy.
+        self.stream_stop_btn = ttk.Button(
+            row3, text="停止记录", command=self._stop_auto_stream, state=tk.DISABLED
+        )
+        self.stream_stop_btn.pack(side=tk.LEFT, padx=(0, 6))
+
     def _build_main_area(self) -> None:
         main = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         main.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 8))
@@ -569,6 +1105,7 @@ class DSHostGui(tk.Tk):
         left.columnconfigure(0, weight=1)
         self._build_capture_panel(left)
         self._build_cal_panel(left)
+        self._build_auto_panel(left)
         self._build_latest_panel(left)
 
         right.columnconfigure(0, weight=1)
@@ -600,11 +1137,12 @@ class DSHostGui(tk.Tk):
         self.wave_canvas.bind("<Configure>", lambda _event: self._redraw_wave())
 
     def _build_capture_panel(self, parent: ttk.Frame) -> None:
-        panel = ttk.LabelFrame(parent, text="采集信息", padding=10)
+        panel = ttk.LabelFrame(parent, text="采集信息（手动 / 自动）", padding=10)
         panel.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         panel.columnconfigure(1, weight=1)
 
         rows = [
+            ("模式", "mode"),
             ("帧号", "frame_id"),
             ("耗时", "elapsed"),
             ("波形包", "wave_chunks"),
@@ -654,9 +1192,30 @@ class DSHostGui(tk.Tk):
                 row=row, column=1, sticky="ew", pady=2
             )
 
+    def _build_auto_panel(self, parent: ttk.Frame) -> None:
+        panel = ttk.LabelFrame(parent, text="自动模式", padding=10)
+        panel.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        panel.columnconfigure(1, weight=1)
+
+        rows = [
+            ("激活", "active"),
+            ("转速 rpm", "rpm"),
+            ("t_speed ms", "t_speed_ms"),
+            ("阈值 um", "thr_um"),
+            ("点数", "points"),
+            ("t_idle ms", "t_idle_ms"),
+            ("最近 L2 um", "last_l2_um"),
+            ("触发次数", "triggers"),
+        ]
+        for row, (label, key) in enumerate(rows):
+            ttk.Label(panel, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Label(panel, textvariable=self.auto_vars[key], style="Value.TLabel").grid(
+                row=row, column=1, sticky="ew", pady=2
+            )
+
     def _build_latest_panel(self, parent: ttk.Frame) -> None:
         panel = ttk.LabelFrame(parent, text="本帧摘要", padding=10)
-        panel.grid(row=2, column=0, sticky="ew")
+        panel.grid(row=3, column=0, sticky="ew")
         panel.columnconfigure(1, weight=1)
 
         rows = [
@@ -758,6 +1317,20 @@ class DSHostGui(tk.Tk):
         self.log_text.delete("1.0", tk.END)
         self.log_text.configure(state=tk.DISABLED)
 
+    def _on_close(self) -> None:
+        if self.streaming and self.stream_stop_event is not None:
+            self.stream_stop_event.set()
+            self.worker_state_var.set("正在安全结束记录…")
+            self.after(100, self._finish_close)
+            return
+        self.destroy()
+
+    def _finish_close(self) -> None:
+        if self.streaming:
+            self.after(100, self._finish_close)
+        else:
+            self.destroy()
+
     def _append_log(self, message: str) -> None:
         stamp = time.strftime("%H:%M:%S")
         self.log_text.configure(state=tk.NORMAL)
@@ -809,11 +1382,19 @@ class DSHostGui(tk.Tk):
         thread = threading.Thread(target=target, daemon=True)
         thread.start()
 
-    def _start_command(self, command: str, wait_s: float) -> None:
+    def _start_command(
+        self,
+        command: str,
+        wait_s: float,
+        stop_on_first_reply: bool = False,
+    ) -> None:
         worker = self._make_worker()
         if worker is None:
             return
-        self._start_thread(lambda: worker.run_command(command, wait_s), f"执行 {command}")
+        self._start_thread(
+            lambda: worker.run_command(command, wait_s, stop_on_first_reply),
+            f"执行 {command}",
+        )
 
     def _start_custom_command(self) -> None:
         command = self.command_var.get().strip()
@@ -826,11 +1407,77 @@ class DSHostGui(tk.Tk):
         worker = self._make_worker()
         if worker is None:
             return
-        self._reset_capture_views()
+        self._reset_capture_views("手动单帧")
         self._start_thread(worker.run_capture, "采集中")
 
-    def _reset_capture_views(self) -> None:
+    def _read_auto_config(self) -> Optional[AutoConfig]:
+        try:
+            return parse_auto_config(
+                self.auto_rpm_var.get(),
+                self.auto_thr_var.get(),
+                self.auto_points_var.get(),
+            )
+        except ValueError as exc:
+            messagebox.showerror("参数错误", f"自动模式参数无效: {exc}")
+            return None
+
+    def _start_auto(self) -> None:
+        config = self._read_auto_config()
+        if config is not None:
+            self._start_command(config.command("AUTO_START"), 1.5, True)
+
+    def _apply_auto_config(self) -> None:
+        config = self._read_auto_config()
+        if config is not None:
+            self._start_command(config.command("AUTO_CFG"), 1.2, True)
+
+    def _start_auto_stream(self, start_auto: bool = False) -> None:
+        if self.busy or self.streaming:
+            return
+        worker = self._make_worker()
+        if worker is None:
+            return
+        startup_command: Optional[str] = None
+        if start_auto:
+            config = self._read_auto_config()
+            if config is None:
+                return
+            startup_command = config.command("AUTO_START")
+        out_dir = unique_output_dir(
+            Path(self.output_root_var.get()).expanduser(),
+            "auto_log",
+        )
+        self._reset_capture_views("自动连续")
+        self.info_vars["out_dir"].set(str(out_dir))
+        self.info_vars["sensor_chunks"].set("自动模式不回传")
+        self.info_vars["sensor_records"].set("自动模式不回传")
+        self.stream_started_monotonic = time.monotonic()
+        stop_event = threading.Event()
+        self.stream_stop_event = stop_event
+        self.streaming = True
+        self._set_busy(True, "连续记录中 0 帧")
+        self.stream_stop_btn.configure(state=tk.NORMAL)
+        thread = threading.Thread(
+            target=lambda: worker.run_auto_stream(
+                stop_event,
+                out_dir,
+                startup_command=startup_command,
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+    def _stop_auto_stream(self) -> None:
+        if self.stream_stop_event is not None:
+            self.stream_stop_event.set()
+            self.stream_stop_btn.configure(state=tk.DISABLED)
+            self.worker_state_var.set("正在停止记录…")
+
+    def _reset_capture_views(self, mode: str = "-") -> None:
         self.current_frame = None
+        self.stream_wave_buf = None
+        self.stream_wave_fid = None
+        self.stream_wave_dirty = False
         self.wave_points = []
         self.wave_min = 0
         self.wave_max = 65535
@@ -838,6 +1485,7 @@ class DSHostGui(tk.Tk):
         self.sensor_progress_var.set(0)
         for var in self.info_vars.values():
             var.set("-")
+        self.info_vars["mode"].set(mode)
         self.info_vars["wave_chunks"].set("0/?")
         self.info_vars["wave_samples"].set("0/?")
         self.info_vars["sensor_chunks"].set("0/?")
@@ -876,8 +1524,65 @@ class DSHostGui(tk.Tk):
             self._append_log(message)
             self._show_frame(event["frame"], Path(event["output_dir"]))
             self._set_busy(False, f"完成 {event.get('status', '')}".strip())
+        elif kind == "stream_wave":
+            self._ingest_stream_wave(event)
+        elif kind == "stream_frame_done":
+            summary = event.get("summary", {})
+            self._populate_summary(summary)
+            self._refresh_summary_labels(summary)
+            frame_id = event.get("frame_id")
+            complete = bool(event.get("complete"))
+            missing = event.get("missing_chunks")
+            self.info_vars["frame_id"].set(str(frame_id))
+            if self.stream_started_monotonic is not None:
+                self.info_vars["elapsed"].set(
+                    f"{time.monotonic() - self.stream_started_monotonic:.2f} s（本次记录）"
+                )
+            self.info_vars["summary"].set("已收到" if summary else "未收到")
+            self.info_vars["wave_chunks"].set(
+                fmt_count(event.get("received_chunks"), event.get("total_chunks"))
+            )
+            self.info_vars["wave_samples"].set(
+                fmt_count(event.get("received_samples"), event.get("total_samples"))
+            )
+            self.info_vars["missing"].set(
+                f"WV32 {missing if missing is not None else '?'}；"
+                f"{'完整，已追加到会话波形文件' if complete else '不完整，未写入波形文件'}"
+            )
+            complete_frames = event.get("complete_frames", 0)
+            incomplete_frames = event.get("incomplete_frames", 0)
+            self.info_vars["packets"].set(
+                f"WV32 {event.get('received_chunks', 0)}, "
+                f"BAD {event.get('bad_datagrams', 0)}"
+            )
+            self.worker_state_var.set(
+                f"连续记录：完整 {complete_frames}，不完整 {incomplete_frames}"
+            )
+            if not complete:
+                self._append_log(
+                    f"#HOST,incomplete_frame,frame={frame_id},"
+                    f"reason={event.get('reason', '')},missing={missing}"
+                )
+        elif kind == "stream_done":
+            self.streaming = False
+            self.stream_stop_event = None
+            self.stream_started_monotonic = None
+            self.stream_stop_btn.configure(state=tk.DISABLED)
+            self._append_log(
+                f"#HOST,auto_stream_done,frames={event.get('frames', 0)},"
+                f"complete={event.get('complete_frames', 0)},"
+                f"incomplete={event.get('incomplete_frames', 0)},"
+                f"bad={event.get('bad_datagrams', 0)},"
+                f"dir={event.get('output_dir', '')}"
+            )
+            self._set_busy(False, "空闲")
         elif kind == "error":
             self._append_log(f"#HOST,error,{event.get('message', '')}")
+            if self.streaming:
+                self.streaming = False
+                self.stream_stop_event = None
+                self.stream_started_monotonic = None
+                self.stream_stop_btn.configure(state=tk.DISABLED)
             self._set_busy(False, "空闲")
             messagebox.showerror(str(event.get("title", "错误")), str(event.get("message", "")))
 
@@ -955,6 +1660,9 @@ class DSHostGui(tk.Tk):
 
     def _ingest_status_line(self, line: str) -> None:
         tag, values = parse_hash_kv_line(line)
+        if tag == "AUTO":
+            self._ingest_auto_line(line, values)
+            return
         if tag != "CAL":
             return
 
@@ -979,7 +1687,83 @@ class DSHostGui(tk.Tk):
         if "verify_mean_uV" in values:
             self.cal_vars["cal_zero_residual_uV"].set(values["verify_mean_uV"])
 
+    def _ingest_auto_line(self, line: str, values: Dict[str, str]) -> None:
+        """Refresh the auto-mode panel from #AUTO,... lines (STARTED/STOPPED/
+        CFG_OK/AUTO_STATUS replies all share the #AUTO tag)."""
+        if "STARTED" in line:
+            self.auto_vars["active"].set("是")
+        if "STOPPED" in line:
+            self.auto_vars["active"].set("否")
+        for key in ("rpm", "t_speed_ms", "thr_um", "points", "t_idle_ms",
+                    "last_l2_um", "triggers"):
+            if key in values:
+                self.auto_vars[key].set(values[key])
+        if "active" in values:
+            self.auto_vars["active"].set(fmt_bool(values["active"]))
+
+    def _ingest_stream_wave(self, event: Dict[str, Any]) -> None:
+        fid = event.get("frame_id")
+        total = int(event.get("total_samples", 0) or 0)
+        start = int(event.get("start_sample", 0) or 0)
+        payload = event.get("payload", b"")
+        if total <= 0 or not payload:
+            return
+        if (self.stream_wave_fid != fid or self.stream_wave_buf is None
+                or len(self.stream_wave_buf) != total * 4):
+            self.stream_wave_fid = fid
+            self.stream_wave_buf = bytearray(total * 4)
+        end = start * 4 + len(payload)
+        if end > len(self.stream_wave_buf):
+            return
+        self.stream_wave_buf[start * 4 : end] = payload
+        received_chunks = event.get("received_chunks", 0)
+        total_chunks = event.get("total_chunks")
+        received_samples = event.get("received_samples", 0)
+        self.info_vars["frame_id"].set(str(fid))
+        if self.stream_started_monotonic is not None:
+            self.info_vars["elapsed"].set(
+                f"{time.monotonic() - self.stream_started_monotonic:.2f} s（本次记录）"
+            )
+        self.info_vars["wave_chunks"].set(fmt_count(received_chunks, total_chunks))
+        self.info_vars["wave_samples"].set(fmt_count(received_samples, total))
+        if total_chunks:
+            self.wave_progress_var.set(
+                min(100.0, 100.0 * int(received_chunks or 0) / int(total_chunks))
+            )
+        if not self.stream_wave_dirty:
+            self.stream_wave_dirty = True
+            self.after(50, self._redraw_stream_wave)
+
+    def _redraw_stream_wave(self) -> None:
+        self.stream_wave_dirty = False
+        if self.stream_wave_buf is None:
+            return
+        data = self.stream_wave_buf
+        total_samples = len(data) // 4
+        if total_samples <= 0:
+            return
+        try:
+            max_points = int(self.preview_points_var.get())
+        except ValueError:
+            max_points = 1600
+        step = max(1, total_samples // max(1, max_points))
+        points: List[Tuple[int, int, int]] = []
+        min_v = 32767
+        max_v = -32768
+        for idx in range(0, total_samples, step):
+            a_val, b_val = struct.unpack_from("<hh", data, idx * 4)
+            points.append((idx, a_val, b_val))
+            min_v = min(min_v, a_val, b_val)
+            max_v = max(max_v, a_val, b_val)
+        self.wave_points = points
+        self.wave_min = min_v
+        self.wave_max = max_v
+        self._redraw_wave()
+
     def _refresh_wave_preview(self) -> None:
+        if self.streaming and self.stream_wave_buf is not None:
+            self._redraw_stream_wave()
+            return
         if self.current_frame is None:
             self.wave_points = []
             self._redraw_wave()
@@ -1053,11 +1837,16 @@ class DSHostGui(tk.Tk):
             fill="#6b7280",
             font=("Consolas", 8),
         )
+        sample_total = ADC_SAMPLE_COUNT
+        if self.streaming and self.stream_wave_buf is not None:
+            sample_total = len(self.stream_wave_buf) // 4
+        elif self.current_frame is not None and self.current_frame.wave_total_samples:
+            sample_total = self.current_frame.wave_total_samples
         canvas.create_text(
             right,
             height - 16,
             anchor=tk.E,
-            text=f"{ADC_SAMPLE_COUNT:,} samples/channel, int16",
+            text=f"{sample_total:,} samples/channel, int16",
             fill="#6b7280",
             font=("Consolas", 8),
         )

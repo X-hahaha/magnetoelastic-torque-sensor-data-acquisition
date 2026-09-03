@@ -9,27 +9,38 @@
  * through a small asynchronous FIFO into the existing AXI DMA S2MM path:
  *
  *   256-byte FR16 header
- *   SAMPLE_COUNT 32-bit sample pairs, {ADC_B[15:0], ADC_A[15:0]}
+ *   sample_count 32-bit sample pairs, {ADC_B[15:0], ADC_A[15:0]}
  *   fixed-size sensor timeline, 40 bytes/entry
  *   128-byte final summary
  *   40-byte DONE footer with TLAST
+ *
+ * The waveform length is runtime-configurable through sample_count_cfg
+ * (AXI-Lite register in laser_axi_regs). The value is latched when a capture
+ * is accepted, so PS may only change it while no capture is active. All
+ * frame-length fields in header/summary/footer follow the latched value, and
+ * the PS parses the frame with the same count it programmed.
  *
  * Peak-to-peak values are computed while the waveform is captured, so the
  * summary is emitted only after the final waveform word has been accepted.
  */
 module fr16_adc_frame_axis #(
     parameter integer FRAME_HEADER_BYTES = 256,
+    // Legacy default / maximum waveform length; the runtime length comes from
+    // the sample_count_cfg input and is latched per capture.
     parameter integer SAMPLE_COUNT       = 4687500,
     parameter integer SAMPLE_RATE_HZ     = 15625000,
     parameter integer SUMMARY_BYTES      = 128,
     parameter integer FOOTER_BYTES       = 40,
     parameter integer FIFO_ADDR_WIDTH    = 10,
-    parameter integer SENSOR_TIMELINE_DEPTH = 128
+    // 700 us laser polling x 5 channels over a 300 ms capture needs ~2150
+    // entries; 4096 covers it with margin (and faster polling up to ~350 us).
+    parameter integer SENSOR_TIMELINE_DEPTH = 4096
 )(
     input  wire                     clk,
     input  wire                     rst_n,
     input  wire                     enable,
     input  wire                     capture_start_pulse,
+    input  wire [31:0]              sample_count_cfg,
 
     input  wire                     adc_dco,
     input  wire [15:0]              adc_ina,
@@ -78,20 +89,13 @@ module fr16_adc_frame_axis #(
     localparam [15:0] FRAME_HEADER_BYTES_U16 = FRAME_HEADER_BYTES;
 
     localparam integer HEADER_WORDS          = FRAME_HEADER_BYTES / 4;
-    localparam integer WAVE_WORDS            = SAMPLE_COUNT;
-    localparam integer WAVE_BYTES            = SAMPLE_COUNT * 4;
     localparam integer SENSOR_TIMELINE_ENTRY_WORDS = 10;
     localparam integer SENSOR_TIMELINE_ENTRY_BYTES = SENSOR_TIMELINE_ENTRY_WORDS * 4;
     localparam integer SENSOR_TIMELINE_WORDS = SENSOR_TIMELINE_DEPTH * SENSOR_TIMELINE_ENTRY_WORDS;
     localparam integer SENSOR_TIMELINE_BYTES = SENSOR_TIMELINE_DEPTH * SENSOR_TIMELINE_ENTRY_BYTES;
-    localparam integer SENSOR_TIMELINE_OFFSET_BYTES = FRAME_HEADER_BYTES + WAVE_BYTES;
+    localparam integer SENSOR_TIMELINE_ADDR_W = $clog2(SENSOR_TIMELINE_DEPTH);
     localparam integer SUMMARY_WORDS         = SUMMARY_BYTES / 4;
     localparam integer FOOTER_WORDS          = FOOTER_BYTES / 4;
-    localparam integer SUMMARY_OFFSET_BYTES  = SENSOR_TIMELINE_OFFSET_BYTES + SENSOR_TIMELINE_BYTES;
-    localparam integer FOOTER_OFFSET_BYTES   = SUMMARY_OFFSET_BYTES + SUMMARY_BYTES;
-    localparam integer PAYLOAD_BYTES         = FRAME_HEADER_BYTES + WAVE_BYTES + SENSOR_TIMELINE_BYTES + SUMMARY_BYTES + FOOTER_BYTES;
-    localparam integer WORDS_PER_FRAME       = PAYLOAD_BYTES / 4;
-    localparam integer CAPTURE_DURATION_US   = 300000;
 
     localparam [3:0] ST_IDLE      = 4'd0;
     localparam [3:0] ST_HEADER    = 4'd1;
@@ -113,6 +117,21 @@ module fr16_adc_frame_axis #(
     reg [3:0]  sensor_timeline_send_word;
     reg [31:0] summary_index;
     reg [31:0] footer_index;
+
+    // Runtime waveform length, latched from sample_count_cfg at capture start.
+    reg [31:0] sample_count_latched;
+
+    // Frame geometry derived from the latched runtime waveform length.
+    wire [31:0] wave_bytes_rt    = sample_count_latched << 2;
+    wire [31:0] timeline_off_rt  = FRAME_HEADER_BYTES + wave_bytes_rt;
+    wire [31:0] summary_off_rt   = timeline_off_rt + SENSOR_TIMELINE_BYTES;
+    wire [31:0] footer_off_rt    = summary_off_rt + SUMMARY_BYTES;
+    wire [31:0] payload_bytes_rt = footer_off_rt + FOOTER_BYTES;
+    wire [31:0] words_per_frame_rt = payload_bytes_rt >> 2;
+    // capture duration in us = sample_count / 15.625 MHz; (x*131)>>11
+    // approximates x*0.064 with <0.06% error (header is informational; host
+    // can recompute exactly from sample_count and sample_rate_hz).
+    wire [31:0] duration_us_rt   = (sample_count_latched * 32'd131) >> 11;
 
     reg signed [31:0] laser1_latched;
     reg signed [31:0] laser2_latched;
@@ -140,7 +159,7 @@ module fr16_adc_frame_axis #(
     reg [31:0] sensor_timeline_overflow_count;
     reg [319:0] sensor_timeline_read_data;
 
-    (* ram_style = "block" *) reg [319:0] sensor_timeline_mem [0:127];
+    (* ram_style = "block" *) reg [319:0] sensor_timeline_mem [0:SENSOR_TIMELINE_DEPTH-1];
 
     wire fifo_full;
     wire fifo_empty;
@@ -167,13 +186,15 @@ module fr16_adc_frame_axis #(
     wire sensor_timeline_event = sensor_capture_active && (|sensor_valid_pulse);
     wire [4:0] sensor_sample_frac_sum = sensor_sample_frac + 5'd5;
     wire [31:0] sensor_sample_record =
-        (sensor_sample_est >= SAMPLE_COUNT) ? (SAMPLE_COUNT - 1) : sensor_sample_est;
+        (sensor_sample_est >= sample_count_latched) ? (sample_count_latched - 1) :
+                                                      sensor_sample_est;
     wire sensor_start_accept = (state == ST_IDLE) && start_pending && enable;
     wire sensor_timeline_wr_event =
         sensor_timeline_event && (sensor_timeline_count < SENSOR_TIMELINE_DEPTH);
     wire sensor_timeline_wr_en = sensor_start_accept || sensor_timeline_wr_event;
-    wire [6:0] sensor_timeline_wr_addr =
-        sensor_start_accept ? 7'd0 : sensor_timeline_count[6:0];
+    wire [SENSOR_TIMELINE_ADDR_W-1:0] sensor_timeline_wr_addr =
+        sensor_start_accept ? {SENSOR_TIMELINE_ADDR_W{1'b0}} :
+                              sensor_timeline_count[SENSOR_TIMELINE_ADDR_W-1:0];
     wire [319:0] sensor_timeline_start_record = {
         {{16{temperature_x10[15]}}, temperature_x10},
         laser5_um,
@@ -207,8 +228,11 @@ module fr16_adc_frame_axis #(
         (sensor_timeline_send_entry != (SENSOR_TIMELINE_DEPTH - 1)) &&
         ((sensor_timeline_send_entry + 1'b1) < sensor_timeline_count);
     wire sensor_timeline_rd_en = sensor_timeline_load_first || sensor_timeline_load_next;
-    wire [6:0] sensor_timeline_rd_addr =
-        sensor_timeline_load_next ? (sensor_timeline_send_entry[6:0] + 7'd1) : 7'd0;
+    wire [SENSOR_TIMELINE_ADDR_W-1:0] sensor_timeline_rd_addr =
+        sensor_timeline_load_next ?
+            (sensor_timeline_send_entry[SENSOR_TIMELINE_ADDR_W-1:0] +
+             {{(SENSOR_TIMELINE_ADDR_W-1){1'b0}}, 1'b1}) :
+            {SENSOR_TIMELINE_ADDR_W{1'b0}};
 
     assign m_axis_tkeep = 4'hF;
     assign active       = (state != ST_IDLE) || start_pending;
@@ -246,26 +270,26 @@ module fr16_adc_frame_axis #(
             case (idx)
                 32'd0:  make_header_word = FRAME_MAGIC_U32;
                 32'd1:  make_header_word = {FRAME_HEADER_BYTES_U16, FRAME_VERSION_U16};
-                32'd2:  make_header_word = PAYLOAD_BYTES;
-                32'd3:  make_header_word = PAYLOAD_BYTES;
+                32'd2:  make_header_word = payload_bytes_rt;
+                32'd3:  make_header_word = payload_bytes_rt;
                 32'd4:  make_header_word = frame_id_latched;
-                32'd5:  make_header_word = CAPTURE_DURATION_US;
-                32'd6:  make_header_word = SAMPLE_COUNT;
+                32'd5:  make_header_word = duration_us_rt;
+                32'd6:  make_header_word = sample_count_latched;
                 32'd7:  make_header_word = SAMPLE_RATE_HZ;
                 32'd8:  make_header_word = REAL_ADC_FLAG_U32 | HOST_TRIGGER_FLAG_U32;
                 32'd9:  make_header_word = sensor_status_latched;
                 32'd10: make_header_word = FRAME_HEADER_BYTES;
-                32'd11: make_header_word = WAVE_BYTES;
-                32'd12: make_header_word = SUMMARY_OFFSET_BYTES;
+                32'd11: make_header_word = wave_bytes_rt;
+                32'd12: make_header_word = summary_off_rt;
                 32'd13: make_header_word = SUMMARY_BYTES;
-                32'd14: make_header_word = FOOTER_OFFSET_BYTES;
+                32'd14: make_header_word = footer_off_rt;
                 32'd15: make_header_word = FOOTER_BYTES;
-                32'd16: make_header_word = PAYLOAD_BYTES;
+                32'd16: make_header_word = payload_bytes_rt;
                 32'd17: make_header_word = {26'd0, valid_latched};
                 32'd18: make_header_word = overrun_at_start;
                 32'd19: make_header_word = backpressure_at_start;
                 32'd20: make_header_word = fifo_overflow_at_start;
-                32'd21: make_header_word = SENSOR_TIMELINE_OFFSET_BYTES;
+                32'd21: make_header_word = timeline_off_rt;
                 32'd22: make_header_word = SENSOR_TIMELINE_BYTES;
                 32'd23: make_header_word = SENSOR_TIMELINE_DEPTH;
                 32'd24: make_header_word = SENSOR_TIMELINE_ENTRY_BYTES;
@@ -295,7 +319,7 @@ module fr16_adc_frame_axis #(
                 32'd13: make_summary_word = frame_overrun_count;
                 32'd14: make_summary_word = fifo_overflow_count;
                 32'd15: make_summary_word = {31'd0, frame_fifo_overflow_latched};
-                32'd16: make_summary_word = SENSOR_TIMELINE_OFFSET_BYTES;
+                32'd16: make_summary_word = timeline_off_rt;
                 32'd17: make_summary_word = SENSOR_TIMELINE_BYTES;
                 32'd18: make_summary_word = sensor_timeline_count;
                 32'd19: make_summary_word = SENSOR_TIMELINE_ENTRY_BYTES;
@@ -331,10 +355,10 @@ module fr16_adc_frame_axis #(
             case (idx)
                 32'd0: make_footer_word = FOOTER_MAGIC_U32;
                 32'd1: make_footer_word = frame_id_latched;
-                32'd2: make_footer_word = WORDS_PER_FRAME;
-                32'd3: make_footer_word = PAYLOAD_BYTES;
-                32'd4: make_footer_word = PAYLOAD_BYTES;
-                32'd5: make_footer_word = SAMPLE_COUNT;
+                32'd2: make_footer_word = words_per_frame_rt;
+                32'd3: make_footer_word = payload_bytes_rt;
+                32'd4: make_footer_word = payload_bytes_rt;
+                32'd5: make_footer_word = sample_count_latched;
                 32'd6: make_footer_word = 32'd0;
                 32'd7: make_footer_word = 32'd0;
                 32'd8: make_footer_word = REAL_ADC_FLAG_U32 | HOST_TRIGGER_FLAG_U32 |
@@ -390,6 +414,12 @@ module fr16_adc_frame_axis #(
     reg adc_start_s2;
     reg adc_start_s3;
     wire adc_start_pulse = adc_start_s2 ^ adc_start_s3;
+
+    // Quasi-static CDC of the runtime waveform length into the ADC DCO domain.
+    // sample_count_latched only changes while no capture is active, so a plain
+    // two-flop synchronizer is sufficient.
+    reg [31:0] adc_sample_count_s1;
+    reg [31:0] adc_sample_count_s2;
 
     reg        adc_active;
     reg [31:0] adc_sample_index;
@@ -487,6 +517,8 @@ module fr16_adc_frame_axis #(
             adc_start_s1           <= 1'b0;
             adc_start_s2           <= 1'b0;
             adc_start_s3           <= 1'b0;
+            adc_sample_count_s1    <= SAMPLE_COUNT;
+            adc_sample_count_s2    <= SAMPLE_COUNT;
             adc_active             <= 1'b0;
             adc_sample_index       <= 32'd0;
             adc_done_toggle        <= 1'b0;
@@ -516,6 +548,8 @@ module fr16_adc_frame_axis #(
             adc_start_s1 <= adc_start_toggle;
             adc_start_s2 <= adc_start_s1;
             adc_start_s3 <= adc_start_s2;
+            adc_sample_count_s1 <= sample_count_latched;
+            adc_sample_count_s2 <= adc_sample_count_s1;
 
             if (adc_start_pulse && !adc_active) begin
                 filt_shift_a[0] <= adc_ina_s;
@@ -538,7 +572,7 @@ module fr16_adc_frame_axis #(
                 adc_frame_overflow <= fifo_full;
                 adc_or_accum       <= {adc_orb, adc_ora};
 
-                if (SAMPLE_COUNT == 1) begin
+                if (adc_sample_count_s2 == 32'd1) begin
                     adc_a_raw_pp_final      <= 32'd0;
                     adc_b_raw_pp_final      <= 32'd0;
                     adc_a_filt_pp_final     <= 32'd0;
@@ -577,7 +611,7 @@ module fr16_adc_frame_axis #(
                     filt_max_b <= filt_max_next_b;
                 end
 
-                if (adc_sample_index == SAMPLE_COUNT - 1) begin
+                if (adc_sample_index == (adc_sample_count_s2 - 32'd1)) begin
                     adc_a_raw_pp_final <= {15'd0, diff_s16(raw_max_next_a, raw_min_next_a)};
                     adc_b_raw_pp_final <= {15'd0, diff_s16(raw_max_next_b, raw_min_next_b)};
                     if (filt_valid) begin
@@ -637,6 +671,7 @@ module fr16_adc_frame_axis #(
             sensor_timeline_send_word   <= 4'd0;
             summary_index               <= 32'd0;
             footer_index                <= 32'd0;
+            sample_count_latched        <= SAMPLE_COUNT;
             laser1_latched              <= 32'sd0;
             laser2_latched              <= 32'sd0;
             laser3_latched              <= 32'sd0;
@@ -706,7 +741,7 @@ module fr16_adc_frame_axis #(
                     sensor_us_div <= sensor_us_div + 1'b1;
                 end
 
-                if (sensor_sample_est < SAMPLE_COUNT) begin
+                if (sensor_sample_est < sample_count_latched) begin
                     if (sensor_sample_frac_sum >= 5'd16) begin
                         sensor_sample_frac <= sensor_sample_frac_sum - 5'd16;
                         sensor_sample_est  <= sensor_sample_est + 1'b1;
@@ -729,6 +764,7 @@ module fr16_adc_frame_axis #(
                     if (start_pending && enable) begin
                         next_frame_id          <= next_frame_id + 1'b1;
                         frame_id_latched       <= next_frame_id + 1'b1;
+                        sample_count_latched   <= sample_count_cfg;
                         header_index           <= 32'd0;
                         wave_index             <= 32'd0;
                         sensor_timeline_send_entry <= 32'd0;
@@ -778,7 +814,7 @@ module fr16_adc_frame_axis #(
 
                 ST_WAVE: begin
                     if (fire_word) begin
-                        if (wave_index == (WAVE_WORDS - 1)) begin
+                        if (wave_index == (sample_count_latched - 32'd1)) begin
                             state <= ST_WAIT_DONE;
                         end else begin
                             wave_index <= wave_index + 1'b1;

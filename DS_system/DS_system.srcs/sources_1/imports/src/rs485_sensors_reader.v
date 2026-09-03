@@ -5,8 +5,8 @@
  *
  * Laser side:
  *   - Configures each PDL sensor at power-up: cancel zero + absolute-distance output.
- *   - Baud rate is kept at 9600 bps by default because each laser has an independent
- *     RS485 port and one distance read completes within the 200 ms acquisition period.
+ *   - Runs at 468800 bps (sensor pre-configured; no baud-change command is sent)
+ *     with a 700 us poll period per channel, so each laser updates at ~1.4 kHz.
  *
  * Temperature side:
  *   - Kept at the manual/default 9600 bps. No baud-rate configuration command is sent.
@@ -67,7 +67,7 @@ module rs485_sensors_reader #(
         .CLK_FREQ_HZ      (CLK_FREQ_HZ),
         .INIT_BAUD_RATE   (LASER_INIT_BAUD),
         .LASER_BAUD_RATE  (LASER_BAUD_RATE),
-        .POLL_INTERVAL_MS (20),
+        .POLL_PERIOD_US  (700),
         .RX_TIMEOUT_MS    (80),
         .WORD_SWAP        (1),
         .SLAVE_ADDR       (SENSOR_ADDR)
@@ -91,7 +91,7 @@ module rs485_sensors_reader #(
         .CLK_FREQ_HZ      (CLK_FREQ_HZ),
         .INIT_BAUD_RATE   (LASER_INIT_BAUD),
         .LASER_BAUD_RATE  (LASER_BAUD_RATE),
-        .POLL_INTERVAL_MS (20),
+        .POLL_PERIOD_US  (700),
         .RX_TIMEOUT_MS    (80),
         .WORD_SWAP        (1),
         .SLAVE_ADDR       (SENSOR_ADDR)
@@ -115,7 +115,7 @@ module rs485_sensors_reader #(
         .CLK_FREQ_HZ      (CLK_FREQ_HZ),
         .INIT_BAUD_RATE   (LASER_INIT_BAUD),
         .LASER_BAUD_RATE  (LASER_BAUD_RATE),
-        .POLL_INTERVAL_MS (20),
+        .POLL_PERIOD_US  (700),
         .RX_TIMEOUT_MS    (80),
         .WORD_SWAP        (1),
         .SLAVE_ADDR       (SENSOR_ADDR)
@@ -139,7 +139,7 @@ module rs485_sensors_reader #(
         .CLK_FREQ_HZ      (CLK_FREQ_HZ),
         .INIT_BAUD_RATE   (LASER_INIT_BAUD),
         .LASER_BAUD_RATE  (LASER_BAUD_RATE),
-        .POLL_INTERVAL_MS (20),
+        .POLL_PERIOD_US  (700),
         .RX_TIMEOUT_MS    (80),
         .WORD_SWAP        (1),
         .SLAVE_ADDR       (SENSOR_ADDR)
@@ -163,7 +163,7 @@ module rs485_sensors_reader #(
         .CLK_FREQ_HZ      (CLK_FREQ_HZ),
         .INIT_BAUD_RATE   (LASER_INIT_BAUD),
         .LASER_BAUD_RATE  (LASER_BAUD_RATE),
-        .POLL_INTERVAL_MS (20),
+        .POLL_PERIOD_US  (700),
         .RX_TIMEOUT_MS    (80),
         .WORD_SWAP        (1),
         .SLAVE_ADDR       (SENSOR_ADDR)

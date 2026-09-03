@@ -467,7 +467,17 @@ class DSHost:
 
         self.drain(0.1)
         self.send_command("CAPTURE")
+        return self._receive_frame(frame, split_channels)
 
+    def capture_passive(self, output_root: Path, split_channels: bool = False) -> CaptureFrame:
+        """Receive one frame without sending CAPTURE (auto mode triggers board-side)."""
+        capture_dir = output_root / f"capture_{now_stamp()}"
+        frame = CaptureFrame(output_dir=capture_dir)
+
+        self.drain(0.1)
+        return self._receive_frame(frame, split_channels)
+
+    def _receive_frame(self, frame: CaptureFrame, split_channels: bool) -> CaptureFrame:
         deadline = time.time() + self.timeout_s
         summary_deadline: Optional[float] = None
         last_progress = time.time()
@@ -578,6 +588,34 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("cal-status", help="send CAL_STATUS and print responses")
     sub.add_parser("cal-start", help="send CAL_START and print responses")
 
+    auto_start = sub.add_parser(
+        "auto-start",
+        help="start auto acquisition (requires calibration; no args = firmware presets)",
+    )
+    auto_start.add_argument("--rpm", type=int, default=None, help="shaft speed, e.g. 1000")
+    auto_start.add_argument("--threshold", type=int, default=None,
+                            help="L2 trigger threshold in um (default 32000); requires --rpm")
+    auto_start.add_argument("--points", type=int, default=None,
+                            help="waveform samples per channel (default 3125); requires --threshold")
+
+    sub.add_parser("auto-stop", help="stop auto acquisition and restore manual long frame")
+    sub.add_parser("auto-status", help="send AUTO_STATUS and print responses")
+
+    auto_cfg = sub.add_parser("auto-cfg", help="update auto mode parameters (live or preset)")
+    auto_cfg.add_argument("--rpm", type=int, default=None, help="shaft speed, e.g. 1000")
+    auto_cfg.add_argument("--threshold", type=int, default=None,
+                          help="L2 trigger threshold in um; requires --rpm")
+    auto_cfg.add_argument("--points", type=int, default=None,
+                          help="waveform samples per channel; requires --threshold")
+
+    auto_recv = sub.add_parser(
+        "auto-recv",
+        help="passively receive auto-mode frame(s) (board triggers; no CAPTURE sent)",
+    )
+    auto_recv.add_argument("-n", "--count", type=int, default=1, help="number of frames")
+    auto_recv.add_argument("--interval", type=float, default=0.0, help="delay between completed frames")
+    auto_recv.add_argument("--split-channels", action="store_true", help="also save A/B channel raw files")
+
     command = sub.add_parser("command", help="send an arbitrary ASCII command")
     command.add_argument("text", help="command text, e.g. DMA_DEBUG")
     command.add_argument("--wait", type=float, default=1.0, help="seconds to receive text replies")
@@ -586,6 +624,23 @@ def build_parser() -> argparse.ArgumentParser:
     listen.add_argument("--seconds", type=float, default=10.0, help="listen duration")
 
     return parser
+
+
+def _auto_command(prefix: str, rpm, threshold, points) -> str:
+    """Build a positional AUTO_* command string; omitted trailing fields keep
+    the firmware-side presets. Middle fields cannot be skipped."""
+    fields = []
+    if rpm is not None:
+        fields.append(str(rpm))
+    if threshold is not None:
+        if rpm is None:
+            raise SystemExit("error: --threshold requires --rpm (positional fields)")
+        fields.append(str(threshold))
+    if points is not None:
+        if threshold is None:
+            raise SystemExit("error: --points requires --threshold (positional fields)")
+        fields.append(str(points))
+    return prefix if not fields else prefix + "," + ",".join(fields)
 
 
 def run(args: argparse.Namespace) -> int:
@@ -620,6 +675,30 @@ def run(args: argparse.Namespace) -> int:
             return 0
         if args.cmd == "cal-start":
             host.transact_text("CAL_START", 1.0)
+            return 0
+        if args.cmd == "auto-start":
+            host.transact_text(_auto_command("AUTO_START", args.rpm, args.threshold, args.points), 1.0)
+            return 0
+        if args.cmd == "auto-stop":
+            host.transact_text("AUTO_STOP", 1.0)
+            return 0
+        if args.cmd == "auto-status":
+            host.transact_text("AUTO_STATUS", 1.0)
+            return 0
+        if args.cmd == "auto-cfg":
+            if args.rpm is None and args.threshold is None and args.points is None:
+                print("auto-cfg: nothing to set (use --rpm/--threshold/--points)", file=sys.stderr)
+                return 2
+            host.transact_text(_auto_command("AUTO_CFG", args.rpm, args.threshold, args.points), 1.0)
+            return 0
+        if args.cmd == "auto-recv":
+            root = args.out
+            for idx in range(args.count):
+                if args.count > 1 and not args.quiet:
+                    print(f"frame {idx + 1}/{args.count}", flush=True)
+                host.capture_passive(root, split_channels=args.split_channels)
+                if idx + 1 < args.count and args.interval > 0:
+                    time.sleep(args.interval)
             return 0
         if args.cmd == "command":
             host.transact_text(args.text, args.wait)

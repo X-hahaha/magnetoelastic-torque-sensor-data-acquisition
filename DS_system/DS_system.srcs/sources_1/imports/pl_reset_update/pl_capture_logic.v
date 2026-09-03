@@ -70,6 +70,9 @@ module pl_capture_logic (
     input  wire [11:0] ps_adc_sample_rd_addr,
     output wire [31:0] ps_adc_sample_rd_data,
 
+    // Runtime waveform length from laser_axi_regs (samples per channel).
+    input  wire [31:0] sample_count_cfg,
+
     (* X_INTERFACE_IGNORE = "TRUE" *) (* mark_debug = "true" *) output wire [31:0] M_AXIS_FRAME_TDATA,
     (* X_INTERFACE_IGNORE = "TRUE" *) (* mark_debug = "true" *) output wire [3:0]  M_AXIS_FRAME_TKEEP,
     (* X_INTERFACE_IGNORE = "TRUE" *) (* mark_debug = "true" *) output wire        M_AXIS_FRAME_TVALID,
@@ -82,13 +85,15 @@ module pl_capture_logic (
 );
 
     localparam integer SYS_CLK_FREQ_HZ      = 50_000_000;
-    localparam integer ADC_SAMPLE_COUNT     = 4687500;
+    // Waveform length is runtime-configurable via sample_count_cfg (AXI-Lite
+    // register in laser_axi_regs, default 4687500 = 0.3 s); the frame packer
+    // latches it at capture start. Manual mode = default, auto mode = short.
     localparam integer SAMPLE_RATE_HZ       = 15625000;
     localparam integer FRAME_HEADER_BYTES   = 256;
     localparam integer SUMMARY_BYTES        = 128;
     localparam integer FOOTER_BYTES         = 40;
     localparam integer FIFO_ADDR_WIDTH      = 10;
-    localparam integer SENSOR_TIMELINE_DEPTH = 128;
+    localparam integer SENSOR_TIMELINE_DEPTH = 4096;
 
     wire clk_125m;
     wire clk_15_625m_debug;
@@ -152,8 +157,8 @@ module pl_capture_logic (
 
     rs485_sensors_reader #(
         .CLK_FREQ_HZ     (SYS_CLK_FREQ_HZ),
-        .LASER_INIT_BAUD (9600),
-        .LASER_BAUD_RATE (9600),
+        .LASER_INIT_BAUD (468800),
+        .LASER_BAUD_RATE (468800),
         .TEMP_BAUD_RATE  (9600),
         .SENSOR_ADDR     (8'h01)
     ) u_rs485_sensors_reader (
@@ -196,7 +201,6 @@ module pl_capture_logic (
 
     fr16_adc_frame_axis #(
         .FRAME_HEADER_BYTES (FRAME_HEADER_BYTES),
-        .SAMPLE_COUNT       (ADC_SAMPLE_COUNT),
         .SAMPLE_RATE_HZ     (SAMPLE_RATE_HZ),
         .SUMMARY_BYTES      (SUMMARY_BYTES),
         .FOOTER_BYTES       (FOOTER_BYTES),
@@ -207,6 +211,7 @@ module pl_capture_logic (
         .rst_n                     (sys_rst_n),
         .enable                    (adc_config_done),
         .capture_start_pulse       (ps_adc_sample_rd_en),
+        .sample_count_cfg          (sample_count_cfg),
         .adc_dco                   (ADC_DCOA),
         .adc_ina                   (ADC_INA),
         .adc_inb                   (ADC_INB),

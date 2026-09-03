@@ -15,8 +15,8 @@
       "hp_smartconnect_0": "",
       "m1_axis_bridge_0": "",
       "system_ila_0": "",
-      "laser_axi_regs_0": "",
-      "pl_capture_logic_0": ""
+      "pl_capture_logic_0": "",
+      "laser_axi_regs_0": ""
     },
     "interface_ports": {
       "DDR": {
@@ -844,6 +844,252 @@
           }
         }
       },
+      "pl_capture_logic_0": {
+        "vlnv": "xilinx.com:module_ref:pl_capture_logic:1.0",
+        "xci_name": "ps_system_pl_capture_logic_0_0",
+        "reference_info": {
+          "ref_type": "hdl",
+          "ref_name": "pl_capture_logic",
+          "boundary_crc": "0x0"
+        },
+        "ports": {
+          "CLK_50M": {
+            "type": "clk",
+            "direction": "I",
+            "parameters": {
+              "ASSOCIATED_RESET": {
+                "value": "RST_N",
+                "value_src": "constant"
+              },
+              "CLK_DOMAIN": {
+                "value": "ps_system_CLK_50M",
+                "value_src": "default_prop"
+              },
+              "FREQ_HZ": {
+                "value": "50000000",
+                "value_src": "constant"
+              }
+            }
+          },
+          "RST_N": {
+            "type": "rst",
+            "direction": "I",
+            "parameters": {
+              "POLARITY": {
+                "value": "ACTIVE_LOW",
+                "value_src": "constant"
+              }
+            }
+          },
+          "ADC_CLK": {
+            "type": "clk",
+            "direction": "O"
+          },
+          "ps_pl_reset_hold": {
+            "direction": "I"
+          },
+          "ADC_INA": {
+            "direction": "I",
+            "left": "15",
+            "right": "0"
+          },
+          "ADC_INB": {
+            "direction": "I",
+            "left": "15",
+            "right": "0"
+          },
+          "ADC_DCOA": {
+            "direction": "I"
+          },
+          "ADC_DCOB": {
+            "direction": "I"
+          },
+          "ADC_ORA": {
+            "direction": "I"
+          },
+          "ADC_ORB": {
+            "direction": "I"
+          },
+          "ADC_PDWN": {
+            "direction": "O"
+          },
+          "ADC_OEB": {
+            "direction": "O"
+          },
+          "ADC_CSB": {
+            "direction": "O"
+          },
+          "ADC_SCLK": {
+            "direction": "O"
+          },
+          "ADC_SDIO": {
+            "direction": "IO"
+          },
+          "TXD_TEMPERATURE": {
+            "direction": "I"
+          },
+          "RXD_TEMPERATURE": {
+            "direction": "O"
+          },
+          "TXD_LAYSER1": {
+            "direction": "I"
+          },
+          "RXD_LAYSER1": {
+            "direction": "O"
+          },
+          "TXD_LAYSER2": {
+            "direction": "I"
+          },
+          "RXD_LAYSER2": {
+            "direction": "O"
+          },
+          "TXD_LAYSER3": {
+            "direction": "I"
+          },
+          "RXD_LAYSER3": {
+            "direction": "O"
+          },
+          "TXD_LAYSER4": {
+            "direction": "I"
+          },
+          "RXD_LAYSER4": {
+            "direction": "O"
+          },
+          "TXD_LAYSER5": {
+            "direction": "I"
+          },
+          "RXD_LAYSER5": {
+            "direction": "O"
+          },
+          "ps_frame_id": {
+            "direction": "O",
+            "left": "31",
+            "right": "0"
+          },
+          "ps_laser1_um": {
+            "direction": "O",
+            "left": "31",
+            "right": "0"
+          },
+          "ps_laser2_um": {
+            "direction": "O",
+            "left": "31",
+            "right": "0"
+          },
+          "ps_laser3_um": {
+            "direction": "O",
+            "left": "31",
+            "right": "0"
+          },
+          "ps_laser4_um": {
+            "direction": "O",
+            "left": "31",
+            "right": "0"
+          },
+          "ps_laser5_um": {
+            "direction": "O",
+            "left": "31",
+            "right": "0"
+          },
+          "ps_temperature_x10": {
+            "direction": "O",
+            "left": "15",
+            "right": "0"
+          },
+          "ps_adc_a_raw_pp": {
+            "direction": "O",
+            "left": "31",
+            "right": "0"
+          },
+          "ps_adc_b_raw_pp": {
+            "direction": "O",
+            "left": "31",
+            "right": "0"
+          },
+          "ps_adc_a_filt_pp": {
+            "direction": "O",
+            "left": "31",
+            "right": "0"
+          },
+          "ps_adc_b_filt_pp": {
+            "direction": "O",
+            "left": "31",
+            "right": "0"
+          },
+          "ps_sensor_valid_seen": {
+            "direction": "O",
+            "left": "5",
+            "right": "0"
+          },
+          "ps_sensor_crc_error": {
+            "direction": "O",
+            "left": "5",
+            "right": "0"
+          },
+          "ps_sensor_timeout_error": {
+            "direction": "O",
+            "left": "5",
+            "right": "0"
+          },
+          "ps_sensor_frame_error": {
+            "direction": "O",
+            "left": "5",
+            "right": "0"
+          },
+          "ps_adc_sample_rd_en": {
+            "direction": "I"
+          },
+          "ps_adc_sample_rd_addr": {
+            "direction": "I",
+            "left": "11",
+            "right": "0"
+          },
+          "ps_adc_sample_rd_data": {
+            "direction": "O",
+            "left": "31",
+            "right": "0"
+          },
+          "sample_count_cfg": {
+            "direction": "I",
+            "left": "31",
+            "right": "0"
+          },
+          "M_AXIS_FRAME_TDATA": {
+            "direction": "O",
+            "left": "31",
+            "right": "0"
+          },
+          "M_AXIS_FRAME_TKEEP": {
+            "direction": "O",
+            "left": "3",
+            "right": "0"
+          },
+          "M_AXIS_FRAME_TVALID": {
+            "direction": "O"
+          },
+          "M_AXIS_FRAME_TREADY": {
+            "direction": "I"
+          },
+          "M_AXIS_FRAME_TLAST": {
+            "direction": "O"
+          },
+          "ps_axis_frame_id": {
+            "direction": "O",
+            "left": "31",
+            "right": "0"
+          },
+          "ps_axis_overrun_count": {
+            "direction": "O",
+            "left": "31",
+            "right": "0"
+          },
+          "ps_axis_backpressure_count": {
+            "direction": "O",
+            "left": "31",
+            "right": "0"
+          }
+        }
+      },
       "laser_axi_regs_0": {
         "vlnv": "xilinx.com:module_ref:laser_axi_regs:1.0",
         "xci_name": "ps_system_laser_axi_regs_0_0",
@@ -1174,270 +1420,48 @@
             "left": "31",
             "right": "0"
           },
+          "sample_count_cfg": {
+            "direction": "O",
+            "left": "31",
+            "right": "0"
+          },
           "pl_soft_reset_hold": {
             "direction": "O"
-          }
-        }
-      },
-      "pl_capture_logic_0": {
-        "vlnv": "xilinx.com:module_ref:pl_capture_logic:1.0",
-        "xci_name": "ps_system_pl_capture_logic_0_0",
-        "reference_info": {
-          "ref_type": "hdl",
-          "ref_name": "pl_capture_logic",
-          "boundary_crc": "0x0"
-        },
-        "ports": {
-          "CLK_50M": {
-            "type": "clk",
-            "direction": "I",
-            "parameters": {
-              "ASSOCIATED_RESET": {
-                "value": "RST_N",
-                "value_src": "constant"
-              },
-              "CLK_DOMAIN": {
-                "value": "ps_system_CLK_50M",
-                "value_src": "default_prop"
-              },
-              "FREQ_HZ": {
-                "value": "50000000",
-                "value_src": "constant"
-              }
-            }
-          },
-          "RST_N": {
-            "type": "rst",
-            "direction": "I",
-            "parameters": {
-              "POLARITY": {
-                "value": "ACTIVE_LOW",
-                "value_src": "constant"
-              }
-            }
-          },
-          "ADC_CLK": {
-            "type": "clk",
-            "direction": "O"
-          },
-          "ps_pl_reset_hold": {
-            "direction": "I"
-          },
-          "ADC_INA": {
-            "direction": "I",
-            "left": "15",
-            "right": "0"
-          },
-          "ADC_INB": {
-            "direction": "I",
-            "left": "15",
-            "right": "0"
-          },
-          "ADC_DCOA": {
-            "direction": "I"
-          },
-          "ADC_DCOB": {
-            "direction": "I"
-          },
-          "ADC_ORA": {
-            "direction": "I"
-          },
-          "ADC_ORB": {
-            "direction": "I"
-          },
-          "ADC_PDWN": {
-            "direction": "O"
-          },
-          "ADC_OEB": {
-            "direction": "O"
-          },
-          "ADC_CSB": {
-            "direction": "O"
-          },
-          "ADC_SCLK": {
-            "direction": "O"
-          },
-          "ADC_SDIO": {
-            "direction": "IO"
-          },
-          "TXD_TEMPERATURE": {
-            "direction": "I"
-          },
-          "RXD_TEMPERATURE": {
-            "direction": "O"
-          },
-          "TXD_LAYSER1": {
-            "direction": "I"
-          },
-          "RXD_LAYSER1": {
-            "direction": "O"
-          },
-          "TXD_LAYSER2": {
-            "direction": "I"
-          },
-          "RXD_LAYSER2": {
-            "direction": "O"
-          },
-          "TXD_LAYSER3": {
-            "direction": "I"
-          },
-          "RXD_LAYSER3": {
-            "direction": "O"
-          },
-          "TXD_LAYSER4": {
-            "direction": "I"
-          },
-          "RXD_LAYSER4": {
-            "direction": "O"
-          },
-          "TXD_LAYSER5": {
-            "direction": "I"
-          },
-          "RXD_LAYSER5": {
-            "direction": "O"
-          },
-          "ps_frame_id": {
-            "direction": "O",
-            "left": "31",
-            "right": "0"
-          },
-          "ps_laser1_um": {
-            "direction": "O",
-            "left": "31",
-            "right": "0"
-          },
-          "ps_laser2_um": {
-            "direction": "O",
-            "left": "31",
-            "right": "0"
-          },
-          "ps_laser3_um": {
-            "direction": "O",
-            "left": "31",
-            "right": "0"
-          },
-          "ps_laser4_um": {
-            "direction": "O",
-            "left": "31",
-            "right": "0"
-          },
-          "ps_laser5_um": {
-            "direction": "O",
-            "left": "31",
-            "right": "0"
-          },
-          "ps_temperature_x10": {
-            "direction": "O",
-            "left": "15",
-            "right": "0"
-          },
-          "ps_adc_a_raw_pp": {
-            "direction": "O",
-            "left": "31",
-            "right": "0"
-          },
-          "ps_adc_b_raw_pp": {
-            "direction": "O",
-            "left": "31",
-            "right": "0"
-          },
-          "ps_adc_a_filt_pp": {
-            "direction": "O",
-            "left": "31",
-            "right": "0"
-          },
-          "ps_adc_b_filt_pp": {
-            "direction": "O",
-            "left": "31",
-            "right": "0"
-          },
-          "ps_sensor_valid_seen": {
-            "direction": "O",
-            "left": "5",
-            "right": "0"
-          },
-          "ps_sensor_crc_error": {
-            "direction": "O",
-            "left": "5",
-            "right": "0"
-          },
-          "ps_sensor_timeout_error": {
-            "direction": "O",
-            "left": "5",
-            "right": "0"
-          },
-          "ps_sensor_frame_error": {
-            "direction": "O",
-            "left": "5",
-            "right": "0"
-          },
-          "ps_adc_sample_rd_en": {
-            "direction": "I"
-          },
-          "ps_adc_sample_rd_addr": {
-            "direction": "I",
-            "left": "11",
-            "right": "0"
-          },
-          "ps_adc_sample_rd_data": {
-            "direction": "O",
-            "left": "31",
-            "right": "0"
-          },
-          "M_AXIS_FRAME_TDATA": {
-            "direction": "O",
-            "left": "31",
-            "right": "0"
-          },
-          "M_AXIS_FRAME_TKEEP": {
-            "direction": "O",
-            "left": "3",
-            "right": "0"
-          },
-          "M_AXIS_FRAME_TVALID": {
-            "direction": "O"
-          },
-          "M_AXIS_FRAME_TREADY": {
-            "direction": "I"
-          },
-          "M_AXIS_FRAME_TLAST": {
-            "direction": "O"
-          },
-          "ps_axis_frame_id": {
-            "direction": "O",
-            "left": "31",
-            "right": "0"
-          },
-          "ps_axis_overrun_count": {
-            "direction": "O",
-            "left": "31",
-            "right": "0"
-          },
-          "ps_axis_backpressure_count": {
-            "direction": "O",
-            "left": "31",
-            "right": "0"
           }
         }
       }
     },
     "interface_nets": {
+      "processing_system7_0_M_AXI_GP0": {
+        "interface_ports": [
+          "processing_system7_0/M_AXI_GP0",
+          "smartconnect_0/S00_AXI"
+        ]
+      },
       "axi_dma_0_M_AXI_S2MM": {
         "interface_ports": [
           "axi_dma_0/M_AXI_S2MM",
           "hp_smartconnect_0/S00_AXI"
         ]
       },
-      "processing_system7_0_FIXED_IO": {
+      "smartconnect_0_M01_AXI": {
         "interface_ports": [
-          "FIXED_IO",
-          "processing_system7_0/FIXED_IO"
+          "smartconnect_0/M01_AXI",
+          "axi_dma_0/S_AXI_LITE"
         ]
       },
-      "processing_system7_0_M_AXI_GP0": {
+      "m1_axis_bridge_0_M_AXIS1": {
         "interface_ports": [
-          "processing_system7_0/M_AXI_GP0",
-          "smartconnect_0/S00_AXI"
+          "m1_axis_bridge_0/M_AXIS",
+          "axi_dma_0/S_AXIS_S2MM",
+          "system_ila_0/SLOT_1_AXIS"
+        ]
+      },
+      "axi_dma_0_M_AXI_SG": {
+        "interface_ports": [
+          "axi_dma_0/M_AXI_SG",
+          "hp_smartconnect_0/S01_AXI",
+          "system_ila_0/SLOT_0_AXI"
         ]
       },
       "hp_smartconnect_0_M00_AXI": {
@@ -1452,30 +1476,16 @@
           "laser_axi_regs_0/S_AXI"
         ]
       },
-      "axi_dma_0_M_AXI_SG": {
-        "interface_ports": [
-          "axi_dma_0/M_AXI_SG",
-          "hp_smartconnect_0/S01_AXI",
-          "system_ila_0/SLOT_0_AXI"
-        ]
-      },
-      "m1_axis_bridge_0_M_AXIS1": {
-        "interface_ports": [
-          "m1_axis_bridge_0/M_AXIS",
-          "axi_dma_0/S_AXIS_S2MM",
-          "system_ila_0/SLOT_1_AXIS"
-        ]
-      },
-      "smartconnect_0_M01_AXI": {
-        "interface_ports": [
-          "smartconnect_0/M01_AXI",
-          "axi_dma_0/S_AXI_LITE"
-        ]
-      },
       "processing_system7_0_DDR": {
         "interface_ports": [
           "DDR",
           "processing_system7_0/DDR"
+        ]
+      },
+      "processing_system7_0_FIXED_IO": {
+        "interface_ports": [
+          "FIXED_IO",
+          "processing_system7_0/FIXED_IO"
         ]
       }
     },
@@ -1558,8 +1568,8 @@
           "processing_system7_0/S_AXI_HP0_ACLK",
           "m1_axis_bridge_0/aclk",
           "system_ila_0/clk",
-          "laser_axi_regs_0/S_AXI_ACLK",
-          "pl_capture_logic_0/CLK_50M"
+          "pl_capture_logic_0/CLK_50M",
+          "laser_axi_regs_0/S_AXI_ACLK"
         ]
       },
       "pl_capture_logic_0_ADC_CLK": {
@@ -1713,8 +1723,8 @@
           "axi_dma_0/axi_resetn",
           "hp_smartconnect_0/aresetn",
           "m1_axis_bridge_0/aresetn",
-          "laser_axi_regs_0/S_AXI_ARESETN",
-          "pl_capture_logic_0/RST_N"
+          "pl_capture_logic_0/RST_N",
+          "laser_axi_regs_0/S_AXI_ARESETN"
         ]
       },
       "pl_capture_logic_0_ps_adc_b_filt_pp": {
@@ -1793,6 +1803,12 @@
         "ports": [
           "pl_capture_logic_0/M_AXIS_FRAME_TLAST",
           "m1_axis_bridge_0/in_last"
+        ]
+      },
+      "laser_axi_regs_0_sample_count_cfg": {
+        "ports": [
+          "laser_axi_regs_0/sample_count_cfg",
+          "pl_capture_logic_0/sample_count_cfg"
         ]
       }
     },

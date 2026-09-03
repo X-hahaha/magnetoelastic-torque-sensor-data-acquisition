@@ -4,23 +4,29 @@
  *
  * PDL-xxx-485 laser reader with power-up configuration, fixed baud.
  *
- * This version does NOT change the PDL baud rate.
+ * This version does NOT change the PDL baud rate; the sensor must already be
+ * configured for LASER_BAUD_RATE (468800 bps in the current build).
  * At power-up it uses LASER_BAUD_RATE to:
  *   1) cancel zero setting;
  *   2) set output data format to absolute distance;
  *   3) continuously read the distance register.
  *
- * Default LASER_BAUD_RATE is 9600. At 9600 bps, one distance read frame
- * comfortably completes within a 200 ms system capture period on each
- * independent RS485 port, so no baud-rate change is required.
+ * At 468800 bps one request/response transaction takes ~400 us (8-byte request
+ * + 30 us turnaround + 9-byte response, plus sensor latency), so the 700 us
+ * poll period leaves ~300 us of budget for the sensor response.
  *
  * Output distance_um is the PDL returned absolute distance value in um.
+ *
+ * Distance polling runs on a fixed period of POLL_PERIOD_US (default 700 us),
+ * measured from the start of each request transaction. If a transaction
+ * overruns the period (slow sensor response or timeout), the next request
+ * starts immediately after it completes.
  */
 module pdl030_config_distance_reader #(
     parameter integer CLK_FREQ_HZ       = 50_000_000,
     parameter integer INIT_BAUD_RATE    = 9600,       // kept for compatibility; not used
     parameter integer LASER_BAUD_RATE   = 9600,
-    parameter integer POLL_INTERVAL_MS  = 20,
+    parameter integer POLL_PERIOD_US    = 700,
     parameter integer RX_TIMEOUT_MS     = 80,
     parameter integer WORD_SWAP         = 1,
     parameter [7:0]   SLAVE_ADDR        = 8'h01
@@ -45,7 +51,7 @@ module pdl030_config_distance_reader #(
 
     localparam integer MAX_TX_BYTES = 16;
     localparam integer MAX_RX_BYTES = 16;
-    localparam integer POLL_CLKS    = (CLK_FREQ_HZ / 1000) * POLL_INTERVAL_MS;
+    localparam integer POLL_PERIOD_CLKS = (CLK_FREQ_HZ / 1_000_000) * POLL_PERIOD_US;
 
     // Register addresses from the PDL manual command table used in previous verified code.
     localparam [15:0] REG_CANCEL_ZERO = 16'h0002;
@@ -128,7 +134,7 @@ module pdl030_config_distance_reader #(
         .MAX_TX_BYTES  (MAX_TX_BYTES),
         .MAX_RX_BYTES  (MAX_RX_BYTES),
         .RX_TIMEOUT_MS (RX_TIMEOUT_MS),
-        .TURNAROUND_US (200)
+        .TURNAROUND_US (30)
     ) u_modbus (
         .clk             (clk),
         .rst_n           (rst_n),
@@ -254,10 +260,12 @@ module pdl030_config_distance_reader #(
                     timeout_error <= 1'b0;
                     frame_error <= 1'b0;
                     crc_error <= 1'b0;
+                    timer_cnt <= 32'd0;
                     state <= ST_POLL_WAIT;
                 end
 
                 ST_POLL_WAIT: begin
+                    timer_cnt <= timer_cnt + 1'b1;
                     if(mb_done) begin
                         rx_frame_dbg <= rx9;
                         if(frame_ok) begin
@@ -272,11 +280,9 @@ module pdl030_config_distance_reader #(
                             else
                                 frame_error <= 1'b1;
                         end
-                        timer_cnt <= 32'd0;
                         state <= ST_POLL_GAP;
                     end else if(mb_timeout) begin
                         timeout_error <= 1'b1;
-                        timer_cnt <= 32'd0;
                         state <= ST_POLL_GAP;
                     end else if(mb_framing_error) begin
                         frame_error <= 1'b1;
@@ -284,8 +290,7 @@ module pdl030_config_distance_reader #(
                 end
 
                 ST_POLL_GAP: begin
-                    if(timer_cnt >= POLL_CLKS) begin
-                        timer_cnt <= 32'd0;
+                    if(timer_cnt >= POLL_PERIOD_CLKS) begin
                         state <= ST_POLL_START;
                     end else begin
                         timer_cnt <= timer_cnt + 1'b1;

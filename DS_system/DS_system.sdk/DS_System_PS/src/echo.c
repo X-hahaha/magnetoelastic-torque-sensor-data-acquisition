@@ -15,6 +15,11 @@
  * Added zero-load calibration commands:
  *   CAL_START, CAL_ABORT, CAL_CLEAR, CAL_STATUS, PING
  *
+ * Added auto acquisition mode (keyphasor-like L2 trigger, short frames,
+ * summary + waveform only, requires calibration READY):
+ *   AUTO_START[,rpm[,thr_um[,points]]], AUTO_STOP, AUTO_CFG,rpm,thr,points,
+ *   AUTO_STATUS. Manual CAPTURE is rejected while auto mode is active.
+ *
  * Calibration states in CSV:
  *   0 IDLE, 1 DISCARD, 2 COLLECT, 3 COMPUTE,
  *   4 VERIFY, 5 READY, 6 FAILED
@@ -78,7 +83,7 @@
 #define REG_LASER5_UM         0x18U
 #define REG_TEMP_X10          0x1CU
 #define REG_STATUS            0x20U
-#define REG_PERIOD_US         0x24U
+#define REG_SAMPLE_COUNT      0x24U  /* R/W runtime waveform length (samples/ch) */
 #define REG_ADC_A_RAW_PP      0x28U
 #define REG_ADC_B_RAW_PP      0x2CU
 #define REG_ADC_A_FILT_PP     0x30U
@@ -102,7 +107,11 @@
 #define UDP_LOCAL_PORT        5000U
 #define UDP_REMOTE_PORT       50010U
 
+/* ADC_SAMPLE_COUNT is the manual-mode long-frame length and also the PL
+ * register maximum. Auto mode programs a shorter runtime length through
+ * REG_SAMPLE_COUNT; PS tracks it in g_sample_count (see below). */
 #define ADC_SAMPLE_COUNT              4687500U
+#define ADC_SAMPLE_COUNT_MIN          16U  /* PL moving-average filter length */
 #define WAVE_SAMPLES_PER_PKT          350U
 #define WAVE_HEADER_BYTES             40U
 #define WAVE_PACKET_BYTES             (WAVE_HEADER_BYTES + WAVE_SAMPLES_PER_PKT * 4U)
@@ -123,8 +132,11 @@
 #define FR16_REAL_ADC_FLAG            0x00000002U
 #define FR16_HOST_TRIGGER_FLAG        0x00000004U
 #define FR16_WAVE_OFFSET_BYTES        FR16_HEADER_BYTES
+/* Maximum-layout constants (manual long frame). Used ONLY for ring/BD buffer
+ * sizing and cache maintenance ranges. Per-frame geometry follows the runtime
+ * g_sample_count via the fr16_*_rt() helpers below. */
 #define FR16_WAVE_BYTES               (ADC_SAMPLE_COUNT * 4U)
-#define FR16_SENSOR_TIMELINE_CAPACITY 128U
+#define FR16_SENSOR_TIMELINE_CAPACITY 4096U
 #define FR16_SENSOR_TIMELINE_ENTRY_BYTES LS32_RECORD_BYTES
 #define FR16_SENSOR_TIMELINE_BYTES    (FR16_SENSOR_TIMELINE_CAPACITY * FR16_SENSOR_TIMELINE_ENTRY_BYTES)
 #define FR16_SENSOR_TIMELINE_OFFSET_BYTES (FR16_HEADER_BYTES + FR16_WAVE_BYTES)
@@ -140,6 +152,21 @@
 #define FR16_CAPTURE_BD_MAX_COUNT     8U
 #define FR16_SEND_CHUNKS_PER_POLL     16U
 #define FR16_SEND_SENSOR_CHUNKS_PER_POLL 4U
+
+/* Auto acquisition mode: keyphasor-like trigger. After t_idle exceeds
+ * t_speed_ms (= shaft period from rpm minus AUTO_T_SPEED_MARGIN_MS), the next
+ * L2_um dip below l_threshold_um fires one short capture. Only summary +
+ * waveform are sent (no LS32 timeline). Requires calibration READY. */
+#define AUTO_DEFAULT_L_THRESHOLD_UM   32000L
+#define AUTO_DEFAULT_RPM              1000U
+#define AUTO_DEFAULT_POINTS           3125U  /* 0.2 ms @ 15.625 MHz = 10 x 50 kHz */
+#define AUTO_T_SPEED_MARGIN_MS        5U
+#define AUTO_MIN_T_SPEED_MS           10U
+
+/* DMA receive watchdog: a frame must finish DMA within this time or the
+ * capture is failed visibly instead of wedging cap_state at DMA forever.
+ * Long frame needs ~0.3 s capture + ~0.1 s transfer, so 20 s is generous. */
+#define FR16_DMA_TIMEOUT_MS           20000U
 
 /* AXI DMA v7.x S2MM register offsets, used only for read-only debug/status output. */
 #define FR16_DMA_S2MM_DMACR_OFFSET    0x30U
@@ -319,6 +346,24 @@ static u32 g_startup_link_up_since_ms = 0U;
 static int g_startup_link_wait_reported = 0;
 static calibration_ctx_t g_cal;
 
+/* Runtime waveform length (samples per channel). Mirrors PL REG_SAMPLE_COUNT;
+ * manual mode keeps the default, auto mode programs a shorter value. All
+ * frame geometry below is derived from it instead of compile-time constants. */
+static u32 g_sample_count = ADC_SAMPLE_COUNT;
+
+typedef struct {
+    int  active;
+    s32  l_threshold_um;
+    u32  rpm;
+    u32  t_speed_ms;
+    u32  sample_count;
+    u32  t_idle_ms;
+    u32  last_tick_ms;
+    s32  last_l2_um;
+    u32  trigger_count;
+} auto_mode_ctx_t;
+static auto_mode_ctx_t g_auto;
+
 extern struct netif *echo_netif;
 
 typedef enum {
@@ -361,11 +406,13 @@ static u32 g_capture_total_sensor_chunks = 0U;
 static u32 g_capture_sensor_record_count = 0U;
 static UINTPTR g_capture_frame_addr = (UINTPTR)FR16_RING_BASEADDR;
 static int g_capture_validation_rc = 0;
+static u32 g_capture_dma_start_ms = 0U;
 #endif
 
 static err_t udp_send_text(const char *text);
 static err_t udp_send_bytes(const void *data, u16 len);
 static void calibration_on_sample(u32 a_code, u32 b_code);
+static u32 get_time_ms(void);
 
 static inline u32 read_u32(u32 offset)
 {
@@ -380,6 +427,28 @@ static inline int32_t read_s32(u32 offset)
 static inline void write_u32(u32 offset, u32 value)
 {
     Xil_Out32((UINTPTR)(LASER_REG_BASE + offset), value);
+}
+
+/* Frame geometry derived from the runtime waveform length g_sample_count.
+ * FR16_FRAME_STRIDE_BYTES stays the compile-time maximum and is only used for
+ * ring/BD buffer sizing; per-frame offsets must use these helpers. */
+static inline u32 fr16_wave_bytes_rt(void)    { return g_sample_count * 4U; }
+static inline u32 fr16_timeline_off_rt(void) { return FR16_HEADER_BYTES + fr16_wave_bytes_rt(); }
+static inline u32 fr16_summary_off_rt(void)  { return fr16_timeline_off_rt() + FR16_SENSOR_TIMELINE_BYTES; }
+static inline u32 fr16_footer_off_rt(void)   { return fr16_summary_off_rt() + FR16_SUMMARY_BYTES; }
+static inline u32 fr16_payload_rt(void)      { return fr16_footer_off_rt() + FR16_FOOTER_BYTES; }
+
+/* Program the PL waveform length. Call only while no capture is active: the
+ * PL latches the register at capture start, and PS frame parsing follows
+ * g_sample_count immediately. */
+static int fr16_set_sample_count(u32 count)
+{
+    if ((count < ADC_SAMPLE_COUNT_MIN) || (count > ADC_SAMPLE_COUNT)) {
+        return XST_FAILURE;
+    }
+    write_u32(REG_SAMPLE_COUNT, count);
+    g_sample_count = count;
+    return XST_SUCCESS;
 }
 
 static double abs_double(double x)
@@ -494,8 +563,9 @@ static int fr16_compute_wave_pp(UINTPTR frame_addr, u32 *a_pp, u32 *b_pp)
 
     if ((a_pp == NULL) || (b_pp == NULL) ||
         (hdr->wave_offset != FR16_WAVE_OFFSET_BYTES) ||
-        (hdr->sample_count != ADC_SAMPLE_COUNT) ||
-        (hdr->wave_bytes != FR16_WAVE_BYTES)) {
+        (hdr->sample_count == 0U) ||
+        (hdr->sample_count > ADC_SAMPLE_COUNT) ||
+        (hdr->wave_bytes != (hdr->sample_count * 4U))) {
         return XST_FAILURE;
     }
 
@@ -522,39 +592,56 @@ static int fr16_validate_frame(UINTPTR frame_addr)
 {
     const fr16_frame_header_t *hdr = (const fr16_frame_header_t *)frame_addr;
     const fr16_frame_summary_t *sum;
-    const fr16_frame_footer_t *ftr =
-        (const fr16_frame_footer_t *)(frame_addr + FR16_FOOTER_OFFSET_BYTES);
+    const fr16_frame_footer_t *ftr;
+    u32 wave_bytes;
+    u32 timeline_off;
+    u32 summary_off;
+    u32 footer_off;
+    u32 payload;
     u32 fid;
 
     if ((hdr->magic != FR16_FRAME_MAGIC) ||
         (hdr->version != FR16_FRAME_VERSION) ||
         (hdr->header_bytes != FR16_HEADER_BYTES) ||
-        (hdr->frame_bytes != FR16_FRAME_STRIDE_BYTES) ||
-        (hdr->frame_stride != FR16_FRAME_STRIDE_BYTES) ||
-        (hdr->sample_count != ADC_SAMPLE_COUNT) ||
-        (hdr->wave_offset != FR16_WAVE_OFFSET_BYTES) ||
-        (hdr->wave_bytes != FR16_WAVE_BYTES) ||
-        (hdr->sensor_timeline_offset != FR16_SENSOR_TIMELINE_OFFSET_BYTES) ||
-        (hdr->sensor_timeline_bytes != FR16_SENSOR_TIMELINE_BYTES) ||
-        (hdr->sensor_timeline_capacity != FR16_SENSOR_TIMELINE_CAPACITY) ||
-        (hdr->sensor_timeline_entry_bytes != FR16_SENSOR_TIMELINE_ENTRY_BYTES) ||
-        (hdr->summary_offset != FR16_SUMMARY_OFFSET_BYTES) ||
-        (hdr->summary_bytes != FR16_SUMMARY_BYTES) ||
-        (hdr->footer_offset != FR16_FOOTER_OFFSET_BYTES) ||
-        (hdr->footer_bytes != FR16_FOOTER_BYTES) ||
-        (hdr->payload_bytes != FR16_PAYLOAD_BYTES) ||
+        (hdr->sample_count != g_sample_count) ||
         ((hdr->flags & FR16_REAL_ADC_FLAG) == 0U) ||
         ((hdr->flags & FR16_HOST_TRIGGER_FLAG) == 0U)) {
         g_fr16_bad_header++;
         return -1;
     }
 
+    /* The frame layout is self-describing and follows hdr->sample_count
+     * (already matched against the PS-programmed g_sample_count above). */
+    wave_bytes   = hdr->sample_count * 4U;
+    timeline_off = FR16_HEADER_BYTES + wave_bytes;
+    summary_off  = timeline_off + FR16_SENSOR_TIMELINE_BYTES;
+    footer_off   = summary_off + FR16_SUMMARY_BYTES;
+    payload      = footer_off + FR16_FOOTER_BYTES;
+    ftr = (const fr16_frame_footer_t *)(frame_addr + footer_off);
+
+    if ((hdr->frame_bytes != payload) ||
+        (hdr->frame_stride != payload) ||
+        (hdr->wave_offset != FR16_WAVE_OFFSET_BYTES) ||
+        (hdr->wave_bytes != wave_bytes) ||
+        (hdr->sensor_timeline_offset != timeline_off) ||
+        (hdr->sensor_timeline_bytes != FR16_SENSOR_TIMELINE_BYTES) ||
+        (hdr->sensor_timeline_capacity != FR16_SENSOR_TIMELINE_CAPACITY) ||
+        (hdr->sensor_timeline_entry_bytes != FR16_SENSOR_TIMELINE_ENTRY_BYTES) ||
+        (hdr->summary_offset != summary_off) ||
+        (hdr->summary_bytes != FR16_SUMMARY_BYTES) ||
+        (hdr->footer_offset != footer_off) ||
+        (hdr->footer_bytes != FR16_FOOTER_BYTES) ||
+        (hdr->payload_bytes != payload)) {
+        g_fr16_bad_header++;
+        return -1;
+    }
+
     if ((ftr->magic != FR16_FOOTER_MAGIC) ||
         (ftr->frame_id != hdr->frame_id) ||
-        (ftr->frame_words != FR16_FRAME_WORDS) ||
-        (ftr->frame_bytes != FR16_FRAME_STRIDE_BYTES) ||
-        (ftr->payload_bytes != FR16_PAYLOAD_BYTES) ||
-        (ftr->sample_count != ADC_SAMPLE_COUNT) ||
+        (ftr->frame_words != (payload / 4U)) ||
+        (ftr->frame_bytes != payload) ||
+        (ftr->payload_bytes != payload) ||
+        (ftr->sample_count != g_sample_count) ||
         ((ftr->flags & FR16_REAL_ADC_FLAG) == 0U) ||
         ((ftr->flags & FR16_HOST_TRIGGER_FLAG) == 0U)) {
         g_fr16_bad_footer++;
@@ -562,7 +649,7 @@ static int fr16_validate_frame(UINTPTR frame_addr)
     }
 
     sum = (const fr16_frame_summary_t *)(frame_addr + hdr->summary_offset);
-    if ((sum->sensor_timeline_offset != FR16_SENSOR_TIMELINE_OFFSET_BYTES) ||
+    if ((sum->sensor_timeline_offset != timeline_off) ||
         (sum->sensor_timeline_bytes != FR16_SENSOR_TIMELINE_BYTES) ||
         (sum->sensor_timeline_entry_bytes != FR16_SENSOR_TIMELINE_ENTRY_BYTES) ||
         (sum->sensor_timeline_count > FR16_SENSOR_TIMELINE_CAPACITY)) {
@@ -642,7 +729,11 @@ static int fr16_prepare_capture_bds(void)
     max_len = g_fr16_rx_ring->MaxTransferLen & ~7U;
     if (max_len == 0U) return XST_FAILURE;
 
-    bd_count = (FR16_FRAME_STRIDE_BYTES + max_len - 1U) / max_len;
+    /* Size the BD chain to the ACTUAL frame length, not the maximum stride:
+     * S2MM stops at TLAST and never completes the remaining BDs, so a chain
+     * longer than the frame leaves the capture wedged in DMA state (this is
+     * what hung auto-mode short frames). */
+    bd_count = (fr16_payload_rt() + max_len - 1U) / max_len;
     if ((bd_count == 0U) || (bd_count > FR16_CAPTURE_BD_MAX_COUNT)) {
         xil_printf("FR16 DMA: frame needs %u BDs, limit=%u\r\n",
                    (unsigned int)bd_count,
@@ -658,7 +749,7 @@ static int fr16_prepare_capture_bds(void)
     status = XAxiDma_BdRingAlloc(g_fr16_rx_ring, (int)bd_count, &bd_set);
     if (status != XST_SUCCESS) return status;
 
-    remaining = FR16_FRAME_STRIDE_BYTES;
+    remaining = fr16_payload_rt();
     buf_addr = (UINTPTR)FR16_RING_BASEADDR;
     bd_cur = bd_set;
     for (i = 0U; i < bd_count; i++) {
@@ -675,7 +766,7 @@ static int fr16_prepare_capture_bds(void)
     }
 
     Xil_DCacheInvalidateRange((UINTPTR)FR16_RING_BASEADDR,
-                              FR16_FRAME_STRIDE_BYTES);
+                              fr16_payload_rt());
 
     status = XAxiDma_BdRingToHw(g_fr16_rx_ring, (int)bd_count, bd_set);
     if (status != XST_SUCCESS) {
@@ -688,7 +779,7 @@ static int fr16_prepare_capture_bds(void)
     g_capture_actual_bytes = 0U;
     g_capture_wave_chunk = 0U;
     g_capture_total_chunks =
-        (ADC_SAMPLE_COUNT + WAVE_SAMPLES_PER_PKT - 1U) / WAVE_SAMPLES_PER_PKT;
+        (g_sample_count + WAVE_SAMPLES_PER_PKT - 1U) / WAVE_SAMPLES_PER_PKT;
     g_capture_sensor_chunk = 0U;
     g_capture_total_sensor_chunks = 0U;
     g_capture_sensor_record_count = 0U;
@@ -804,6 +895,7 @@ static int fr16_capture_start(void)
     }
 
     g_capture_state = CAPTURE_STATE_DMA;
+    g_capture_dma_start_ms = get_time_ms();
     write_u32(REG_CAPTURE_CTRL, CAPTURE_START_WORD);
     (void)udp_send_text("#CAPTURE,STARTED\r\n");
     return XST_SUCCESS;
@@ -815,13 +907,13 @@ static err_t fr16_send_wave_chunk(u32 chunk_idx)
     const uint8_t *wave;
     const fr16_frame_summary_t *sum =
         (const fr16_frame_summary_t *)(g_capture_frame_addr +
-                                       FR16_SUMMARY_OFFSET_BYTES);
+                                       fr16_summary_off_rt());
     u32 start;
     u32 count;
     u32 data_bytes;
 
     start = chunk_idx * WAVE_SAMPLES_PER_PKT;
-    count = ADC_SAMPLE_COUNT - start;
+    count = g_sample_count - start;
     if (count > WAVE_SAMPLES_PER_PKT) count = WAVE_SAMPLES_PER_PKT;
     data_bytes = count * 4U;
 
@@ -836,7 +928,7 @@ static err_t fr16_send_wave_chunk(u32 chunk_idx)
     put_u32_le(&pkt[16], g_capture_total_chunks);
     put_u32_le(&pkt[20], start);
     put_u32_le(&pkt[24], count);
-    put_u32_le(&pkt[28], ADC_SAMPLE_COUNT);
+    put_u32_le(&pkt[28], g_sample_count);
     put_u32_le(&pkt[32], adc_code_to_mVpp(sum->adc_a_filt_pp));
     put_u32_le(&pkt[36], adc_code_to_mVpp(sum->adc_b_filt_pp));
 
@@ -871,11 +963,11 @@ static err_t fr16_send_sensor_chunk(u32 chunk_idx)
     put_u32_le(&pkt[20], start);
     put_u32_le(&pkt[24], count);
     put_u32_le(&pkt[28], g_capture_sensor_record_count);
-    put_u32_le(&pkt[32], ADC_SAMPLE_COUNT);
+    put_u32_le(&pkt[32], g_sample_count);
     put_u32_le(&pkt[36], 0U);
 
     records = (const uint8_t *)(g_capture_frame_addr +
-                                FR16_SENSOR_TIMELINE_OFFSET_BYTES +
+                                fr16_timeline_off_rt() +
                                 start * LS32_RECORD_BYTES);
     memcpy(&pkt[LS32_HEADER_BYTES], records, data_bytes);
     return udp_send_bytes(pkt, (u16)(LS32_HEADER_BYTES + data_bytes));
@@ -885,7 +977,7 @@ static err_t fr16_send_summary_csv(UINTPTR frame_addr)
 {
     const fr16_frame_header_t *hdr = (const fr16_frame_header_t *)frame_addr;
     const fr16_frame_summary_t *sum =
-        (const fr16_frame_summary_t *)(frame_addr + FR16_SUMMARY_OFFSET_BYTES);
+        (const fr16_frame_summary_t *)(frame_addr + fr16_summary_off_rt());
     double a_corr_code;
     double b_corr_code;
     double me_2x_code;
@@ -960,6 +1052,18 @@ static void fr16_dma_poll(void)
         u32 remaining_bds = g_capture_bd_count - g_capture_bds_done;
         if (remaining_bds == 0U) return;
 
+        /* Watchdog: if BDs never complete (e.g. TLAST never arrives), fail
+         * the capture so cap_state returns to IDLE and AUTO_STOP/CAPTURE
+         * work again. Note: the still-armed BDs stay owned by hardware, so
+         * later captures may fail to arm until the board is rebooted. */
+        if ((int32_t)(get_time_ms() - g_capture_dma_start_ms) >
+            (int32_t)FR16_DMA_TIMEOUT_MS) {
+            g_fr16_dma_errors++;
+            g_capture_state = CAPTURE_STATE_ERROR;
+            (void)udp_send_text("#ERR,capture_dma_timeout,reboot_may_be_required\r\n");
+            return;
+        }
+
         bd_done = XAxiDma_BdRingFromHw(g_fr16_rx_ring,
                                        (int)remaining_bds,
                                        &bd_set);
@@ -985,8 +1089,8 @@ static void fr16_dma_poll(void)
         if ((g_capture_state == CAPTURE_STATE_DMA) &&
             (g_capture_bds_done >= g_capture_bd_count)) {
             Xil_DCacheInvalidateRange(g_capture_frame_addr,
-                                      FR16_FRAME_STRIDE_BYTES);
-            if (g_capture_actual_bytes != FR16_FRAME_STRIDE_BYTES) {
+                                      fr16_payload_rt());
+            if (g_capture_actual_bytes != fr16_payload_rt()) {
                 g_fr16_dma_errors++;
                 g_capture_state = CAPTURE_STATE_ERROR;
                 (void)udp_send_text("#ERR,capture_length_mismatch\r\n");
@@ -995,7 +1099,7 @@ static void fr16_dma_poll(void)
                     fr16_validate_frame(g_capture_frame_addr);
                 if (g_capture_validation_rc == 0) {
                     sum = (const fr16_frame_summary_t *)(g_capture_frame_addr +
-                                                         FR16_SUMMARY_OFFSET_BYTES);
+                                                         fr16_summary_off_rt());
                     g_fr16_completed++;
                     g_capture_sensor_record_count = sum->sensor_timeline_count;
                     g_capture_total_sensor_chunks =
@@ -1023,7 +1127,10 @@ static void fr16_dma_poll(void)
             budget--;
         }
         if (g_capture_wave_chunk >= g_capture_total_chunks) {
-            g_capture_state = (g_capture_sensor_record_count > 0U) ?
+            /* Auto mode sends summary + waveform only; skip the LS32 timeline
+             * even if the (near-empty) short-frame timeline has records. */
+            g_capture_state = ((g_capture_sensor_record_count > 0U) &&
+                               !g_auto.active) ?
                 CAPTURE_STATE_SEND_SENSOR : CAPTURE_STATE_SEND_SUMMARY;
         }
     }
@@ -1257,8 +1364,10 @@ static void fr16_dma_send_dump(u32 slot, int use_latest)
 
     Xil_DCacheInvalidateRange(addr, FR16_FRAME_STRIDE_BYTES);
     hdr = (const fr16_frame_header_t *)addr;
-    sum = (const fr16_frame_summary_t *)(addr + FR16_SUMMARY_OFFSET_BYTES);
-    ftr = (const fr16_frame_footer_t *)(addr + FR16_FOOTER_OFFSET_BYTES);
+    /* Self-describing layout: follow the offsets stored in the frame so the
+     * dump works for both long (manual) and short (auto) frames. */
+    sum = (const fr16_frame_summary_t *)(addr + hdr->summary_offset);
+    ftr = (const fr16_frame_footer_t *)(addr + hdr->footer_offset);
     n = snprintf(line, sizeof(line),
         "#FDUMP,addr=0x%08x,frame=%u,flags=0x%08x,status=0x%08x,samples=%u,wave_off=%u,wave_bytes=%u,ls_off=%u,ls_bytes=%u,ls_count=%u,summary_off=%u,a_raw=%u,b_raw=%u,a_filt=%u,b_filt=%u,pl_overrun=%u,pl_backpressure=%u,pl_fifo_overrun=%u,footer=0x%08x,footer_frame=%u,words=%u\r\n",
         (unsigned int)addr, (unsigned int)hdr->frame_id,
@@ -1774,6 +1883,293 @@ static void m2_startup_capture_poll(void)
 
 
 /* --------------------------------------------------------------------------
+ * Auto acquisition mode
+ *
+ * Trigger model (keyphasor-like): t_idle counts up continuously. Once
+ * t_idle > t_speed_ms the detection window is open (t_speed = shaft period
+ * from rpm minus AUTO_T_SPEED_MARGIN_MS, so the window opens ~5 ms before the
+ * marker comes around). The first L2_um sample below l_threshold_um inside
+ * the window fires one short capture and resets t_idle. L2 only dips near the
+ * marker, so no separate edge detector is needed.
+ *
+ * Auto mode uses the runtime short frame (g_auto.sample_count points) and
+ * sends only WV32 waveform + summary CSV (LS32 timeline is skipped in
+ * fr16_dma_poll). Manual CAPTURE is rejected while auto mode is active;
+ * AUTO_STOP is the only way back to manual mode. Requires calibration READY.
+ * -------------------------------------------------------------------------- */
+#if HAVE_FR16_AXI_DMA
+static void auto_mode_init(void)
+{
+    /* Preset defaults; AUTO_START without arguments and AUTO_CFG while
+     * inactive both start from these. */
+    g_auto.active = 0;
+    g_auto.l_threshold_um = AUTO_DEFAULT_L_THRESHOLD_UM;
+    g_auto.rpm = AUTO_DEFAULT_RPM;
+    g_auto.t_speed_ms = 60000U / AUTO_DEFAULT_RPM - AUTO_T_SPEED_MARGIN_MS;
+    g_auto.sample_count = AUTO_DEFAULT_POINTS;
+    g_auto.t_idle_ms = 0U;
+    g_auto.last_tick_ms = 0U;
+    g_auto.last_l2_um = 0;
+    g_auto.trigger_count = 0U;
+}
+
+static int auto_compute_t_speed(u32 rpm, u32 *t_speed_ms)
+{
+    u32 period_ms;
+
+    if ((rpm == 0U) || (rpm > 60000U / (AUTO_T_SPEED_MARGIN_MS + 1U))) {
+        return XST_FAILURE;
+    }
+    /* Integer ms per revolution (< 1 ms truncation error, acceptable here). */
+    period_ms = 60000U / rpm;
+    if (period_ms <= AUTO_T_SPEED_MARGIN_MS) {
+        return XST_FAILURE;
+    }
+    if ((period_ms - AUTO_T_SPEED_MARGIN_MS) < AUTO_MIN_T_SPEED_MS) {
+        return XST_FAILURE;
+    }
+    *t_speed_ms = period_ms - AUTO_T_SPEED_MARGIN_MS;
+    return XST_SUCCESS;
+}
+
+/* Parse up to max_fields comma-separated u32 values from str (which may be
+ * NULL/empty for "use defaults"). Modifies str in place. Returns field count. */
+static int auto_parse_u32_fields(char *str, u32 *out, int max_fields)
+{
+    int n = 0;
+    char *p = str;
+    char *comma;
+
+    while ((n < max_fields) && (p != NULL) && (*p != '\0')) {
+        comma = strchr(p, ',');
+        if (comma != NULL) *comma = '\0';
+        out[n++] = (u32)strtoul(p, NULL, 0);
+        p = (comma != NULL) ? (comma + 1) : NULL;
+    }
+    return n;
+}
+
+static void auto_mode_stop(void)
+{
+    g_auto.active = 0;
+    /* Restore the manual-mode long frame. Caller must ensure capture IDLE. */
+    (void)fr16_set_sample_count(ADC_SAMPLE_COUNT);
+}
+
+static void auto_mode_cmd_start(char *args)
+{
+    u32 fields[3];
+    int n;
+    u32 rpm = g_auto.rpm;
+    s32 thr = g_auto.l_threshold_um;
+    u32 points = g_auto.sample_count;
+    u32 t_speed;
+    char line[160];
+
+    if (!g_fr16_dma_ready) {
+        (void)udp_send_text("#ERR,dma_not_ready\r\n");
+        return;
+    }
+    if (g_startup_capture_hold) {
+        (void)udp_send_text("#ERR,startup_wait_link\r\n");
+        return;
+    }
+    if (g_pl_reset_active) {
+        (void)udp_send_text("#ERR,pl_reset_active\r\n");
+        return;
+    }
+    if (g_auto.active) {
+        (void)udp_send_text("#ERR,auto_already_active\r\n");
+        return;
+    }
+    if (g_capture_state != CAPTURE_STATE_IDLE) {
+        (void)udp_send_text("#BUSY,capture_active\r\n");
+        return;
+    }
+    if ((g_cal.state != CAL_STATE_READY) || !g_cal.valid) {
+        (void)udp_send_text("#ERR,not_calibrated\r\n");
+        return;
+    }
+
+    if ((args != NULL) && (*args != '\0')) {
+        n = auto_parse_u32_fields(args, fields, 3);
+        if (n >= 1) rpm = fields[0];
+        if (n >= 2) thr = (s32)fields[1];
+        if (n >= 3) points = fields[2];
+    }
+
+    if (auto_compute_t_speed(rpm, &t_speed) != XST_SUCCESS) {
+        (void)udp_send_text("#ERR,bad_rpm\r\n");
+        return;
+    }
+    if (fr16_set_sample_count(points) != XST_SUCCESS) {
+        (void)udp_send_text("#ERR,bad_points\r\n");
+        return;
+    }
+
+    g_auto.l_threshold_um = thr;
+    g_auto.rpm = rpm;
+    g_auto.t_speed_ms = t_speed;
+    g_auto.sample_count = points;
+    g_auto.t_idle_ms = 0U;
+    g_auto.last_tick_ms = get_time_ms();
+    g_auto.last_l2_um = 0;
+    g_auto.trigger_count = 0U;
+    g_auto.active = 1;
+
+    (void)snprintf(line, sizeof(line),
+        "#AUTO,STARTED,rpm=%u,t_speed_ms=%u,thr_um=%ld,points=%u\r\n",
+        (unsigned int)rpm, (unsigned int)t_speed, (long)thr,
+        (unsigned int)points);
+    (void)udp_send_text(line);
+}
+
+static void auto_mode_cmd_stop(const char *reason)
+{
+    char line[128];
+
+    if (!g_auto.active) {
+        (void)udp_send_text("#ERR,auto_not_active\r\n");
+        return;
+    }
+    if (g_capture_state != CAPTURE_STATE_IDLE) {
+        /* g_sample_count follows the PL register immediately; changing it
+         * mid-frame would corrupt parsing of the in-flight frame. */
+        (void)udp_send_text("#BUSY,capture_active\r\n");
+        return;
+    }
+    (void)snprintf(line, sizeof(line), "#AUTO,STOPPED,reason=%s,triggers=%u\r\n",
+                   reason, (unsigned int)g_auto.trigger_count);
+    auto_mode_stop();
+    (void)udp_send_text(line);
+}
+
+static void auto_mode_cmd_cfg(char *args)
+{
+    u32 fields[3];
+    int n;
+    u32 rpm;
+    s32 thr;
+    u32 points;
+    u32 t_speed;
+    char line[160];
+
+    n = auto_parse_u32_fields(args, fields, 3);
+    if (n < 1) {
+        (void)udp_send_text("#ERR,bad_cfg\r\n");
+        return;
+    }
+
+    rpm = (n >= 1) ? fields[0] : g_auto.rpm;
+    thr = (n >= 2) ? (s32)fields[1] : g_auto.l_threshold_um;
+    points = (n >= 3) ? fields[2] : g_auto.sample_count;
+
+    if (auto_compute_t_speed(rpm, &t_speed) != XST_SUCCESS) {
+        (void)udp_send_text("#ERR,bad_rpm\r\n");
+        return;
+    }
+    if ((points < ADC_SAMPLE_COUNT_MIN) || (points > ADC_SAMPLE_COUNT)) {
+        (void)udp_send_text("#ERR,bad_points\r\n");
+        return;
+    }
+    if (g_auto.active && (points != g_auto.sample_count) &&
+        (g_capture_state != CAPTURE_STATE_IDLE)) {
+        (void)udp_send_text("#BUSY,capture_active\r\n");
+        return;
+    }
+
+    if (g_auto.active && (points != g_auto.sample_count)) {
+        (void)fr16_set_sample_count(points);
+    }
+    /* Inactive: fields become the preset for the next AUTO_START. */
+    g_auto.sample_count = points;
+    g_auto.rpm = rpm;
+    g_auto.l_threshold_um = thr;
+    g_auto.t_speed_ms = t_speed;
+
+    (void)snprintf(line, sizeof(line),
+        "#AUTO,CFG_OK,active=%d,rpm=%u,t_speed_ms=%u,thr_um=%ld,points=%u\r\n",
+        g_auto.active, (unsigned int)rpm, (unsigned int)t_speed, (long)thr,
+        (unsigned int)points);
+    (void)udp_send_text(line);
+}
+
+static void auto_mode_send_status(void)
+{
+    char line[224];
+
+    (void)snprintf(line, sizeof(line),
+        "#AUTO,active=%d,rpm=%u,t_speed_ms=%u,thr_um=%ld,points=%u,"
+        "t_idle_ms=%u,last_l2_um=%ld,triggers=%u,cal_state=%u,cal_valid=%d,"
+        "cap_state=%s\r\n",
+        g_auto.active,
+        (unsigned int)g_auto.rpm,
+        (unsigned int)g_auto.t_speed_ms,
+        (long)g_auto.l_threshold_um,
+        (unsigned int)g_auto.sample_count,
+        (unsigned int)g_auto.t_idle_ms,
+        (long)g_auto.last_l2_um,
+        (unsigned int)g_auto.trigger_count,
+        (unsigned int)g_cal.state,
+        g_cal.valid,
+        capture_state_name(g_capture_state));
+    (void)udp_send_text(line);
+}
+
+static void auto_mode_poll(void)
+{
+    u32 now;
+    s32 l2;
+
+    if (!g_auto.active) return;
+
+    now = get_time_ms();
+    if (now != g_auto.last_tick_ms) {
+        g_auto.t_idle_ms += (now - g_auto.last_tick_ms);
+        g_auto.last_tick_ms = now;
+    }
+
+    l2 = read_s32(REG_LASER2_UM);
+    g_auto.last_l2_um = l2;
+
+    if ((g_auto.t_idle_ms > g_auto.t_speed_ms) &&
+        (l2 < g_auto.l_threshold_um) &&
+        (g_capture_state == CAPTURE_STATE_IDLE)) {
+        g_auto.t_idle_ms = 0U;
+        g_auto.trigger_count++;
+        (void)fr16_capture_start();
+    }
+}
+
+#else /* !HAVE_FR16_AXI_DMA: auto mode needs the DMA capture path */
+static void auto_mode_init(void) { g_auto.active = 0; }
+static void auto_mode_stop(void) { g_auto.active = 0; }
+static void auto_mode_poll(void) { }
+static void auto_mode_cmd_start(char *args)
+{
+    (void)args;
+    (void)udp_send_text("#ERR,dma_not_ready\r\n");
+}
+static void auto_mode_cmd_stop(const char *reason)
+{
+    (void)reason;
+    (void)udp_send_text("#ERR,dma_not_ready\r\n");
+}
+static void auto_mode_cmd_cfg(char *args)
+{
+    (void)args;
+    (void)udp_send_text("#ERR,dma_not_ready\r\n");
+}
+static void auto_mode_send_status(void)
+{
+    (void)udp_send_text("#AUTO,active=0,reason=dma_not_ready\r\n");
+}
+#endif
+
+
+
+
+/* --------------------------------------------------------------------------
  * Unified UDP command receiver
  *
  * Keep the const callback signature used by the user's current SDK project.
@@ -1822,7 +2218,15 @@ static void udp_command_recv(void *arg,
             (void)udp_send_text("#BUSY,pl_reset_rejected\r\n");
         } else
 #endif
-        pl_reset_assert_hold();
+        {
+            /* A PL reset would silently drop auto triggers; leave auto mode
+             * first and restore the long-frame length. */
+            if (g_auto.active) {
+                auto_mode_stop();
+                (void)udp_send_text("#AUTO,STOPPED,reason=pl_reset\r\n");
+            }
+            pl_reset_assert_hold();
+        }
 
     } else if ((strcmp(cmd, "PLRST,0") == 0) ||
                (strcmp(cmd, "PL_RESET_RELEASE") == 0)) {
@@ -1843,6 +2247,10 @@ static void udp_command_recv(void *arg,
             (void)udp_send_text("#ERR,startup_wait_link\r\n");
         } else if (g_pl_reset_active) {
             (void)udp_send_text("#ERR,pl_reset_active\r\n");
+        } else if (g_auto.active) {
+            /* Manual trigger is rejected while auto mode runs; AUTO_STOP
+             * is the only way back to manual mode. */
+            (void)udp_send_text("#ERR,auto_active\r\n");
         } else {
             (void)fr16_capture_start();
         }
@@ -1850,14 +2258,41 @@ static void udp_command_recv(void *arg,
     } else if (strcmp(cmd, "CAL_START") == 0) {
         if (g_pl_reset_active) {
             (void)udp_send_text("#ERR,pl_reset_active\r\n");
+        } else if (g_auto.active) {
+            /* Calibration needs manual long frames. */
+            (void)udp_send_text("#ERR,auto_active\r\n");
         } else {
             calibration_start_new();
         }
+
+    } else if ((strcmp(cmd, "AUTO_START") == 0) ||
+               (strncmp(cmd, "AUTO_START,", 11U) == 0)) {
+        auto_mode_cmd_start((cmd[10] == ',') ? (cmd + 11) : NULL);
+
+    } else if (strcmp(cmd, "AUTO_STOP") == 0) {
+        auto_mode_cmd_stop("host");
+
+    } else if (strncmp(cmd, "AUTO_CFG,", 9U) == 0) {
+        auto_mode_cmd_cfg(cmd + 9);
+
+    } else if (strcmp(cmd, "AUTO_STATUS") == 0) {
+        auto_mode_send_status();
 
     } else if (strcmp(cmd, "CAL_ABORT") == 0) {
         calibration_abort();
 
     } else if (strcmp(cmd, "CAL_CLEAR") == 0) {
+        /* Clearing calibration invalidates the auto-mode entry condition;
+         * stop auto mode so it must be re-entered after a fresh calibration. */
+        if (g_auto.active) {
+            if (g_capture_state != CAPTURE_STATE_IDLE) {
+                (void)udp_send_text("#BUSY,capture_active\r\n");
+                return;
+            } else {
+                auto_mode_stop();
+                (void)udp_send_text("#AUTO,STOPPED,reason=cal_clear\r\n");
+            }
+        }
         calibration_clear();
 
     } else if (strcmp(cmd, "CAL_STATUS") == 0) {
@@ -1988,9 +2423,10 @@ int start_application(void)
 {
     err_t err;
     u32 magic;
-    u32 period_us;
+    u32 sample_count_reg;
 
     calibration_init();
+    auto_mode_init();
     IP4_ADDR(&g_pc_ipaddr, PC_IP0, PC_IP1, PC_IP2, PC_IP3);
 
     g_udp_pcb = udp_new();
@@ -2043,13 +2479,13 @@ int start_application(void)
 #endif
 
     magic = read_u32(REG_MAGIC);
-    period_us = read_u32(REG_PERIOD_US);
+    sample_count_reg = read_u32(REG_SAMPLE_COUNT);
     xil_printf("UDP application started\r\n");
     xil_printf("local_port=%u, remote=%d.%d.%d.%d:%u\r\n",
                UDP_LOCAL_PORT, PC_IP0, PC_IP1, PC_IP2, PC_IP3,
                UDP_REMOTE_PORT);
     xil_printf("magic=0x%08x\r\n", (unsigned int)magic);
-    xil_printf("PERIOD_US_REG=%u\r\n", (unsigned int)period_us);
+    xil_printf("SAMPLE_COUNT_REG=%u\r\n", (unsigned int)sample_count_reg);
     xil_printf("ADC waveform: %u samples/ch, %u samples/UDP packet\r\n",
                (unsigned int)ADC_SAMPLE_COUNT,
                (unsigned int)WAVE_SAMPLES_PER_PKT);
@@ -2058,6 +2494,7 @@ int start_application(void)
                (unsigned int)FR16_SENSOR_TIMELINE_ENTRY_BYTES,
                (unsigned int)LS32_RECORDS_PER_PKT);
     xil_printf("Capture command: CAPTURE or CAP_START\r\n");
+    xil_printf("Auto mode: AUTO_START[,rpm[,thr_um[,points]]] / AUTO_STOP / AUTO_CFG / AUTO_STATUS\r\n");
     xil_printf("PL reset control: PLRST,1 / PLRST,0, watchdog=%u ms\r\n",
                (unsigned int)PL_RESET_KEEPALIVE_MS);
     xil_printf("Calibration frames: discard=%u collect=%u verify=%u\r\n",
@@ -2123,6 +2560,7 @@ int transfer_data(void)
 
 #if HAVE_FR16_AXI_DMA
     if (g_fr16_dma_ready) {
+        auto_mode_poll();
         fr16_dma_poll();
         return 0;
     }

@@ -81,7 +81,7 @@
         <spirit:parameters>
           <spirit:parameter>
             <spirit:name>viewChecksum</spirit:name>
-            <spirit:value>3f68b420</spirit:value>
+            <spirit:value>c65ad0a2</spirit:value>
           </spirit:parameter>
         </spirit:parameters>
       </spirit:view>
@@ -94,7 +94,7 @@
         <spirit:parameters>
           <spirit:parameter>
             <spirit:name>viewChecksum</spirit:name>
-            <spirit:value>3f68b420</spirit:value>
+            <spirit:value>c65ad0a2</spirit:value>
           </spirit:parameter>
         </spirit:parameters>
       </spirit:view>
@@ -770,6 +770,23 @@
         </spirit:wire>
       </spirit:port>
       <spirit:port>
+        <spirit:name>sample_count_cfg</spirit:name>
+        <spirit:wire>
+          <spirit:direction>in</spirit:direction>
+          <spirit:vector>
+            <spirit:left spirit:format="long">31</spirit:left>
+            <spirit:right spirit:format="long">0</spirit:right>
+          </spirit:vector>
+          <spirit:wireTypeDefs>
+            <spirit:wireTypeDef>
+              <spirit:typeName>wire</spirit:typeName>
+              <spirit:viewNameRef>xilinx_anylanguagesynthesis</spirit:viewNameRef>
+              <spirit:viewNameRef>xilinx_anylanguagebehavioralsimulation</spirit:viewNameRef>
+            </spirit:wireTypeDef>
+          </spirit:wireTypeDefs>
+        </spirit:wire>
+      </spirit:port>
+      <spirit:port>
         <spirit:name>M_AXIS_FRAME_TDATA</spirit:name>
         <spirit:wire>
           <spirit:direction>out</spirit:direction>
@@ -928,7 +945,7 @@
         <xilinx:designToolContext>IPI</xilinx:designToolContext>
       </xilinx:designToolContexts>
       <xilinx:coreRevision>1</xilinx:coreRevision>
-      <xilinx:coreCreationDateTime>2026-08-08T02:25:34Z</xilinx:coreCreationDateTime>
+      <xilinx:coreCreationDateTime>2026-09-02T04:54:16Z</xilinx:coreCreationDateTime>
     </xilinx:coreExtensions>
     <xilinx:packagingInfo>
       <xilinx:xilinxVersion>2018.3</xilinx:xilinxVersion>
