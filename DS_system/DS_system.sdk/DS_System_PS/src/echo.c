@@ -158,6 +158,7 @@
  * L2_um dip below l_threshold_um fires one short capture. Only summary +
  * waveform are sent (no LS32 timeline). Requires calibration READY. */
 #define AUTO_DEFAULT_L_THRESHOLD_UM   32000L
+#define LAYSER_MIN_UM                 30000L
 #define AUTO_DEFAULT_RPM              1000U
 #define AUTO_DEFAULT_POINTS           3125U  /* 0.2 ms @ 15.625 MHz = 10 x 50 kHz */
 #define AUTO_T_SPEED_MARGIN_MS        5U
@@ -2133,7 +2134,7 @@ static void auto_mode_poll(void)
     g_auto.last_l2_um = l2;
 
     if ((g_auto.t_idle_ms > g_auto.t_speed_ms) &&
-        (l2 < g_auto.l_threshold_um) &&
+        (LAYSER_MIN_UM < l2) && (l2 < g_auto.l_threshold_um) &&
         (g_capture_state == CAPTURE_STATE_IDLE)) {
         g_auto.t_idle_ms = 0U;
         g_auto.trigger_count++;
