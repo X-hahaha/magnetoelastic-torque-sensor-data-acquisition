@@ -58,7 +58,7 @@ AUTO_MAX_RPM = 4000
 AUTO_MIN_POINTS = 16
 AUTO_MAX_POINTS = ADC_SAMPLE_COUNT
 AUTO_FRAME_STALE_S = 2.0
-L2_TRIGGER_SAMPLE_POINTS = 3000
+WAVE_PREVIEW_POINTS = 3000
 CALIBRATION_MAX_CAPTURE_FRAMES = 64
 
 # AD9268 samples are signed 16-bit codes spanning the configured 9.0 Vpp input
@@ -257,6 +257,19 @@ def iter_sensor_records(frame: CaptureFrame) -> List[Tuple[int, ...]]:
     return records
 
 
+def preview_sample_indices(total_samples: int, max_points: int) -> List[int]:
+    """Return evenly spaced indices with an exact bounded display count."""
+    display_count = min(total_samples, max(1, max_points))
+    if display_count <= 0:
+        return []
+    if display_count == 1:
+        return [0]
+    return [
+        index * (total_samples - 1) // (display_count - 1)
+        for index in range(display_count)
+    ]
+
+
 def make_wave_preview(
     frame: CaptureFrame, max_points: int
 ) -> Tuple[List[Tuple[int, float, float]], float, float]:
@@ -268,12 +281,11 @@ def make_wave_preview(
     if total_samples <= 0:
         return [], 0, 0
 
-    step = max(1, total_samples // max(1, max_points))
     points: List[Tuple[int, float, float]] = []
     min_v = math.inf
     max_v = -math.inf
 
-    for sample_idx in range(0, total_samples, step):
+    for sample_idx in preview_sample_indices(total_samples, max_points):
         off = sample_idx * 4
         if off + 4 > len(data):
             break
@@ -299,23 +311,33 @@ def make_wave_preview(
 class AutoConfig:
     rpm: int
     threshold_um: int
+    points: int
 
     def command(self, prefix: str) -> str:
-        return f"{prefix},{self.rpm},{self.threshold_um},{L2_TRIGGER_SAMPLE_POINTS}"
+        return f"{prefix},{self.rpm},{self.threshold_um},{self.points}"
 
 
-def parse_auto_config(rpm_text: str, threshold_text: str) -> AutoConfig:
+def parse_auto_config(
+    rpm_text: str,
+    threshold_text: str,
+    points_text: str,
+) -> AutoConfig:
     try:
         rpm = int(rpm_text.strip())
         threshold_um = int(threshold_text.strip())
+        points = int(points_text.strip())
     except ValueError as exc:
-        raise ValueError("转速和阈值必须是整数") from exc
+        raise ValueError("转速、阈值和采集点数必须是整数") from exc
 
     if not AUTO_MIN_RPM <= rpm <= AUTO_MAX_RPM:
         raise ValueError(f"转速必须在 {AUTO_MIN_RPM} 到 {AUTO_MAX_RPM} rpm 之间")
     if not -(2**31) <= threshold_um < 2**31:
         raise ValueError("阈值必须在有符号 32 位整数范围内")
-    return AutoConfig(rpm=rpm, threshold_um=threshold_um)
+    if not AUTO_MIN_POINTS <= points <= AUTO_MAX_POINTS:
+        raise ValueError(
+            f"采集点数必须在 {AUTO_MIN_POINTS} 到 {AUTO_MAX_POINTS:,} 之间"
+        )
+    return AutoConfig(rpm=rpm, threshold_um=threshold_um, points=points)
 
 
 def format_calibration_progress(values: Dict[str, str]) -> str:
@@ -1228,17 +1250,19 @@ class DSHostGui(tk.Tk):
         self.pc_port_var = tk.StringVar(value=str(DEFAULT_PC_PORT))
         self.output_root_var = tk.StringVar(value=str(DEFAULT_OUTPUT_ROOT))
         self.command_var = tk.StringVar(value="DMA_DEBUG")
-        self.preview_points_var = tk.StringVar(value="1600")
         self.worker_state_var = tk.StringVar(value="空闲")
 
-        # L2-triggered acquisition controls; sample count is fixed by the GUI.
+        # L2-triggered acquisition controls. Wave preview rendering is fixed
+        # separately at WAVE_PREVIEW_POINTS and does not alter acquisition.
         self.auto_rpm_var = tk.StringVar(value="1000")
         self.auto_thr_var = tk.StringVar(value="32000")
+        self.auto_points_var = tk.StringVar(value="3125")
         self.auto_vars: Dict[str, tk.StringVar] = {
             "active": tk.StringVar(value="-"),
             "rpm": tk.StringVar(value="-"),
             "t_speed_ms": tk.StringVar(value="-"),
             "thr_um": tk.StringVar(value="-"),
+            "points": tk.StringVar(value="-"),
             "t_idle_ms": tk.StringVar(value="-"),
             "last_l2_um": tk.StringVar(value="-"),
             "triggers": tk.StringVar(value="-"),
@@ -1422,6 +1446,10 @@ class DSHostGui(tk.Tk):
         threshold_entry = ttk.Entry(row3, textvariable=self.auto_thr_var, width=8)
         threshold_entry.pack(side=tk.LEFT, padx=(0, 8))
         self.l2_parameter_entries.append(threshold_entry)
+        ttk.Label(row3, text="采集点数").pack(side=tk.LEFT, padx=(0, 4))
+        points_entry = ttk.Entry(row3, textvariable=self.auto_points_var, width=9)
+        points_entry.pack(side=tk.LEFT, padx=(0, 8))
+        self.l2_parameter_entries.append(points_entry)
 
         self.start_monitor_btn = ttk.Button(
             row3,
@@ -1498,18 +1526,6 @@ class DSHostGui(tk.Tk):
         ttk.Label(wave_top, text="波形预览", style="Title.TLabel").grid(
             row=0, column=0, sticky="w"
         )
-        ttk.Label(wave_top, text="预览显示点数").grid(
-            row=0, column=2, sticky="e", padx=(0, 4)
-        )
-        preview = ttk.Combobox(
-            wave_top,
-            textvariable=self.preview_points_var,
-            values=("800", "1600", "3000", "6000"),
-            width=8,
-            state="readonly",
-        )
-        preview.grid(row=0, column=3, sticky="e")
-        preview.bind("<<ComboboxSelected>>", lambda _event: self._refresh_wave_preview())
 
         self.wave_canvas = tk.Canvas(
             right,
@@ -1586,6 +1602,7 @@ class DSHostGui(tk.Tk):
             ("转速 rpm", "rpm"),
             ("t_speed ms", "t_speed_ms"),
             ("阈值 um", "thr_um"),
+            ("采集点数", "points"),
             ("t_idle ms", "t_idle_ms"),
             ("最近 L2 um", "last_l2_um"),
             ("触发次数", "triggers"),
@@ -2111,6 +2128,7 @@ class DSHostGui(tk.Tk):
             return parse_auto_config(
                 self.auto_rpm_var.get(),
                 self.auto_thr_var.get(),
+                self.auto_points_var.get(),
             )
         except ValueError as exc:
             messagebox.showerror("参数错误", f"L2触发参数无效: {exc}")
@@ -2503,7 +2521,7 @@ class DSHostGui(tk.Tk):
             self.auto_vars["active"].set("否")
             self.monitor_starting = False
             self.monitoring = False
-        for key in ("rpm", "t_speed_ms", "thr_um", "t_idle_ms",
+        for key in ("rpm", "t_speed_ms", "thr_um", "points", "t_idle_ms",
                     "last_l2_um", "triggers"):
             if key in values:
                 self.auto_vars[key].set(values[key])
@@ -2555,15 +2573,10 @@ class DSHostGui(tk.Tk):
         total_samples = len(data) // 4
         if total_samples <= 0:
             return
-        try:
-            max_points = int(self.preview_points_var.get())
-        except ValueError:
-            max_points = 1600
-        step = max(1, total_samples // max(1, max_points))
         points: List[Tuple[int, float, float]] = []
         min_v = math.inf
         max_v = -math.inf
-        for idx in range(0, total_samples, step):
+        for idx in preview_sample_indices(total_samples, WAVE_PREVIEW_POINTS):
             a_code, b_code = struct.unpack_from("<hh", data, idx * 4)
             a_val = adc_code_to_volts(a_code)
             b_val = adc_code_to_volts(b_code)
@@ -2583,12 +2596,8 @@ class DSHostGui(tk.Tk):
             self.wave_points = []
             self._redraw_wave()
             return
-        try:
-            max_points = int(self.preview_points_var.get())
-        except ValueError:
-            max_points = 1600
         self.wave_points, self.wave_min, self.wave_max = make_wave_preview(
-            self.current_frame, max_points
+            self.current_frame, WAVE_PREVIEW_POINTS
         )
         self._redraw_wave()
 
