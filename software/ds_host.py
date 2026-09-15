@@ -71,6 +71,8 @@ SUMMARY_COLUMNS = [
     "ls_count",
     "ls_overflow",
 ]
+PC_TIMESTAMP_COLUMN = "pc_timestamp"
+SUMMARY_OUTPUT_COLUMNS = [*SUMMARY_COLUMNS, PC_TIMESTAMP_COLUMN]
 
 TIMELINE_COLUMNS = [
     "timestamp_us",
@@ -88,6 +90,16 @@ TIMELINE_COLUMNS = [
 
 def now_stamp() -> str:
     return _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def format_pc_timestamp(timestamp: Optional[float] = None) -> str:
+    """Format a PC wall-clock timestamp as local ISO-8601 with timezone."""
+    value = time.time() if timestamp is None else timestamp
+    return (
+        _dt.datetime.fromtimestamp(value)
+        .astimezone()
+        .isoformat(timespec="microseconds")
+    )
 
 
 def u32_at(buf: bytes, offset: int) -> int:
@@ -154,6 +166,7 @@ class CaptureFrame:
 
     summary_text: Optional[str] = None
     summary: Dict[str, str] = field(default_factory=dict)
+    summary_received_time: Optional[float] = None
     messages: List[str] = field(default_factory=list)
     stats: PacketStats = field(default_factory=PacketStats)
 
@@ -272,7 +285,8 @@ class CaptureFrame:
         self.sensor_chunk_record_counts[chunk_idx] = count
         self.stats.sensor_packets += 1
 
-    def accept_text(self, text: str) -> None:
+    def accept_text(self, text: str, received_time: Optional[float] = None) -> None:
+        received_at = time.time() if received_time is None else received_time
         self.stats.text_packets += 1
         for line in text.splitlines():
             line = line.strip()
@@ -289,7 +303,9 @@ class CaptureFrame:
                 if self.frame_id == fid:
                     self.summary_text = line
                     self.summary = parsed
-                    self.end_time = time.time()
+                    if self.summary_received_time is None:
+                        self.summary_received_time = received_at
+                    self.end_time = received_at
 
     def _adopt_frame_id(self, frame_id: int) -> None:
         if self.frame_id is None:
@@ -370,9 +386,12 @@ class CaptureFrame:
         path = self.output_dir / f"{frame_tag}_summary.csv"
         with path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(SUMMARY_COLUMNS)
+            writer.writerow(SUMMARY_OUTPUT_COLUMNS)
             if self.summary:
-                writer.writerow([self.summary.get(name, "") for name in SUMMARY_COLUMNS])
+                writer.writerow(
+                    [self.summary.get(name, "") for name in SUMMARY_COLUMNS]
+                    + [format_pc_timestamp(self.summary_received_time)]
+                )
 
     def _write_messages(self, frame_tag: str) -> None:
         path = self.output_dir / f"{frame_tag}_messages.txt"
@@ -383,6 +402,11 @@ class CaptureFrame:
             "frame_id": self.frame_id,
             "start_time_local": _dt.datetime.fromtimestamp(self.start_time).isoformat(),
             "end_time_local": _dt.datetime.fromtimestamp(self.end_time or time.time()).isoformat(),
+            "summary_received_time_local": (
+                format_pc_timestamp(self.summary_received_time)
+                if self.summary_received_time is not None
+                else None
+            ),
             "elapsed_s": (self.end_time or time.time()) - self.start_time,
             "adc_sample_count_expected": ADC_SAMPLE_COUNT,
             "wave": {

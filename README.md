@@ -14,7 +14,7 @@
 - **实时峰峰值统计**：采集过程中硬件实时计算 A/B 通道原始/滤波峰峰值
 - **手动与自动采集**：支持 PC 命令触发长帧，以及基于 L2 阈值和轴转周期的自动短帧触发
 - **UDP 高速回传**：PS 端使用 lwIP RAW API，把 DDR 中的 FR16 帧转换为 `WV32`、`LS32` 和 CSV summary
-- **采集完整性记录**：GUI 自动连续记录会重组乱序分包、识别重复/缺失分包，并拒绝把不完整帧写入波形文件
+- **采集完整性记录**：GUI L2触发连续记录会重组乱序分包、识别重复/缺失分包，并拒绝把不完整帧写入波形文件
 - **PC 工具**：命令行 `ds_host.py`、Tkinter GUI `ds_host_gui.py` 和 MATLAB 离线绘图脚本
 - **脚本化工程管理**：Block Design 通过 Tcl 脚本应用，支持工程复现与回归验证
 
@@ -98,7 +98,7 @@ DS_system/
 │   └── tools/                          # 静态检查/回归脚本
 ├── software/                           # PC 上位机
 │   ├── ds_host.py                      # 命令行 UDP 接收/控制
-│   ├── ds_host_gui.py                  # Tkinter GUI，含手动/自动模式
+│   ├── ds_host_gui.py                  # Tkinter GUI，含手动/L2触发采集
 │   ├── plot_capture_frame.m            # MATLAB 波形绘图
 │   ├── captures/                       # 默认实验输出目录
 │   └── README.md                       # 上位机详细使用说明
@@ -138,7 +138,7 @@ DS_system/
 | 文件 | 功能 |
 |---|---|
 | `ds_host.py` | 命令行手动采集，逐帧保存波形、时间线、summary 和 metadata |
-| `ds_host_gui.py` | Tkinter GUI：手动/自动控制、实时预览、连续记录和完整性检查 |
+| `ds_host_gui.py` | Tkinter GUI：手动/L2触发控制、实时预览、连续记录和完整性检查 |
 | `plot_capture_frame.m` | MATLAB 离线绘制整帧波形、峰峰值包络、激光时间线 |
 
 ---
@@ -200,7 +200,7 @@ frame_bytes = 256 + 4N + 4096×40 + 128 + 40
 | 阈值 `threshold_um` | 有符号 32 位，µm | 检测窗口打开后，L2 小于该值才允许触发 |
 | 点数 `points` | `16~4,687,500` | 决定每次自动采集的波形时长和数据量，时长为 `points / 15,625,000 s` |
 
-自动模式的 PL→DDR 数据仍是完整 FR16：`Header + Waveform + Timeline + Summary + Footer`。区别发生在 PS→PC：自动模式只发送 `WV32 + CSV summary`，不发送 `LS32` 时间线。因此 GUI 自动采集面板的 LS32 字段显示“自动模式不回传”。
+自动模式的 PL→DDR 数据仍是完整 FR16：`Header + Waveform + Timeline + Summary + Footer`。区别发生在 PS→PC：自动模式只发送 `WV32 + CSV summary`，不发送 `LS32` 时间线。因此 GUI 的“L2触发采集”面板会明确显示不回传 LS32。
 
 ---
 
@@ -240,30 +240,29 @@ l1_um, l2_um, l3_um, l4_um, l5_um, temp_x10
 
 每帧最后发送一行 26 列 CSV，包含 frame_id、A/B 原始与滤波峰峰值、当前传感器值、status、校准结果、`ls_count` 和 `ls_overflow`。完整列定义见 [`software/README.md`](software/README.md)。
 
+GUI落盘时会在每个summary行末附加 `pc_timestamp`，记录PC收到该帧summary的本地ISO-8601时间（含时区和微秒）。GUI的 `开始校准` 会自动完成丢弃1帧、采集8帧、验证4帧，并在每帧后查询板端进度；`清除校准信息` 对应 `CAL_CLEAR`。
+
 ---
 
-## GUI 自动连续记录
+## GUI L2触发连续记录
 
-推荐在 `ds_host_gui.py` 中点击“启动并记录”：接收 socket 会先绑定 PC UDP 50010，再发送带当前三个参数的 `AUTO_START`，避免启动自动模式和建立记录线程之间丢失首帧。
+在 `ds_host_gui.py` 中点击“开始监测并记录”：接收 socket 会先绑定 PC UDP 50010，再发送带当前转速、L2阈值和固定 `3000` 点的 `AUTO_START`，避免板端开始触发和建立记录线程之间丢失首帧。
 
 按钮语义：
 
-- **启动自动**：把输入框中的参数随 `AUTO_START` 下发；之后只改输入框不会影响板端。
-- **应用参数**：发送 `AUTO_CFG`。转速和阈值可直接更新；改变点数时要求板端采集状态为空闲，否则返回 `#BUSY,capture_active`。
-- **启动并记录**：先建立接收端，再使用当前输入框参数启动自动模式并记录。
-- **仅开始记录**：只记录已经运行的自动模式，不下发参数。
-- **停止记录**：停止 PC 接收和落盘，不会停止板端自动模式。
-- **停止自动**：发送 `AUTO_STOP`；若一帧仍在采集，板端会先返回 busy，需要空闲后重试。
+- **开始监测并记录**：先建立接收端，再使用当前转速、L2阈值和固定 3000 点启动板端监测并记录；开始后参数输入框禁用。
+- **停止记录**：只停止PC接收和落盘，板端L2监测继续运行，参数仍禁用。
+- **停止监测**：若正在记录则先安全收尾，再重试发送 `AUTO_STOP` 直到板端空闲并确认停止；随后恢复参数输入。
 
-若板端尚未进入自动模式，直接设置参数后点击“启动并记录”。若已经点击过“启动自动”，之后又修改了输入框，必须先点击“应用参数”，再点击“仅开始记录”；仅修改输入框不会改变板端正在使用的参数。
+每次开始新实验时直接设置参数并点击“开始监测并记录”。如果只按了“停止记录”，必须再按“停止监测”后才能修改参数或开始下一次实验。
 
-每次点击“启动并记录”或“仅开始记录”都会建立独立的 `software/captures/auto_log_YYYYMMDD_HHMMSS/` 目录：
+每次点击“开始监测并记录”都会建立独立的 `software/captures/auto_log_YYYYMMDD_HHMMSS/` 目录：
 
 | 文件 | 内容 |
 |---|---|
 | `wave_interleaved_a_b_u16le.bin` | 本次记录所有完整帧共用的一个原始二进制文件，按帧完成顺序连续追加 |
-| `summary.csv` | 收到的所有帧 summary |
-| `integrity.csv` | 每帧的完整性、缺包、重复包、结束原因，以及在聚合波形文件中的字节偏移和长度 |
+| `summary.csv` | 收到的所有帧 summary；每行附加带时区和微秒的PC接收时间 `pc_timestamp` |
+| `integrity.csv` | 每帧的完整性、缺包、重复包、结束原因、PC时间，以及在聚合波形文件中的字节偏移和长度 |
 
 聚合波形文件没有额外插入帧头。每个样点为 4 B：小端 `uint16 ADC_A + uint16 ADC_B`。必须通过 `integrity.csv` 的 `wave_byte_offset`、`wave_bytes` 和 `wave_total_samples` 定位帧；不完整帧不会写入波形文件，对应位置字段留空。
 

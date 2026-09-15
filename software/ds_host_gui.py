@@ -3,9 +3,9 @@
 Tkinter GUI for the DS_system_02ms UDP host.
 
 Manual mode keeps the same one-CAPTURE-at-a-time transaction rule as ds_host.py.
-Auto mode can bind the receive socket before AUTO_START, reassembles concurrent
-frame IDs independently, and records per-frame UDP integrity before accepting a
-waveform as experiment data.
+L2-triggered monitoring binds the receive socket before AUTO_START, reassembles
+concurrent frame IDs independently, and records per-frame UDP integrity before
+accepting a waveform as experiment data.
 """
 
 from __future__ import annotations
@@ -36,9 +36,11 @@ from ds_host import (
     LS32_MAGIC,
     LS32_RECORD_BYTES,
     SUMMARY_COLUMNS,
+    SUMMARY_OUTPUT_COLUMNS,
     TIMELINE_COLUMNS,
     WAVE_HEADER_BYTES,
     WV32_MAGIC,
+    format_pc_timestamp,
     is_summary_row,
     now_stamp,
     parse_summary_row,
@@ -56,6 +58,8 @@ AUTO_MAX_RPM = 4000
 AUTO_MIN_POINTS = 16
 AUTO_MAX_POINTS = ADC_SAMPLE_COUNT
 AUTO_FRAME_STALE_S = 2.0
+L2_TRIGGER_SAMPLE_POINTS = 3000
+CALIBRATION_MAX_CAPTURE_FRAMES = 64
 
 # AD9268 samples are signed 16-bit codes spanning the configured 9.0 Vpp input
 # range.  Keep this conversion identical to plot_capture_frame.m.
@@ -63,9 +67,9 @@ ADC_FULL_SCALE_VPP = 9.0
 ADC_CODE_RANGE = 65536.0
 ADC_VOLTS_PER_CODE = ADC_FULL_SCALE_VPP / ADC_CODE_RANGE
 
-# Torque calibration from the supplied 标定报告.md.  Fifteen frames at the
-# 125 Hz summary rate cover 120 ms (two shaft revolutions at 1000 rpm), which
-# suppresses the dominant rotational modulation before applying the calibration.
+# Torque calibration from the supplied 标定报告.md. The estimator averages 15
+# received trigger frames before applying the calibration. Its time span follows
+# the active trigger interval rather than assuming the report's 125 Hz rate.
 TORQUE_GAIN_NM_PER_UV = 0.4424
 TORQUE_ZERO_UV = 1118.9
 TORQUE_ZERO_NM = 86.4
@@ -92,6 +96,7 @@ STREAM_INTEGRITY_COLUMNS = [
     "bad_wave_packets",
     "unassigned_bad_datagrams",
     "elapsed_s",
+    "pc_timestamp",
 ]
 
 CAL_STATE_NAMES = {
@@ -294,29 +299,54 @@ def make_wave_preview(
 class AutoConfig:
     rpm: int
     threshold_um: int
-    points: int
 
     def command(self, prefix: str) -> str:
-        return f"{prefix},{self.rpm},{self.threshold_um},{self.points}"
+        return f"{prefix},{self.rpm},{self.threshold_um},{L2_TRIGGER_SAMPLE_POINTS}"
 
 
-def parse_auto_config(rpm_text: str, threshold_text: str, points_text: str) -> AutoConfig:
+def parse_auto_config(rpm_text: str, threshold_text: str) -> AutoConfig:
     try:
         rpm = int(rpm_text.strip())
         threshold_um = int(threshold_text.strip())
-        points = int(points_text.strip())
     except ValueError as exc:
-        raise ValueError("转速、阈值和点数必须是整数") from exc
+        raise ValueError("转速和阈值必须是整数") from exc
 
     if not AUTO_MIN_RPM <= rpm <= AUTO_MAX_RPM:
         raise ValueError(f"转速必须在 {AUTO_MIN_RPM} 到 {AUTO_MAX_RPM} rpm 之间")
     if not -(2**31) <= threshold_um < 2**31:
         raise ValueError("阈值必须在有符号 32 位整数范围内")
-    if not AUTO_MIN_POINTS <= points <= AUTO_MAX_POINTS:
-        raise ValueError(
-            f"点数必须在 {AUTO_MIN_POINTS} 到 {AUTO_MAX_POINTS:,} 之间"
-        )
-    return AutoConfig(rpm=rpm, threshold_um=threshold_um, points=points)
+    return AutoConfig(rpm=rpm, threshold_um=threshold_um)
+
+
+def format_calibration_progress(values: Dict[str, str]) -> str:
+    """Show board stage progress in the complete 1 + 8 + 4 transaction."""
+    state = values.get("state", "")
+    attempt = values.get("attempt", "") or "-"
+    try:
+        progress = int(values.get("progress", "0") or "0")
+    except ValueError:
+        progress = 0
+
+    if state == "0":
+        return "未开始"
+    if state == "1":
+        return f"第 {attempt} 次：丢弃 {progress}/1（本轮 {progress}/13）"
+    if state == "2":
+        total = min(13, 1 + progress)
+        return f"第 {attempt} 次：采集 {progress}/8（本轮 {total}/13）"
+    if state == "3":
+        return f"第 {attempt} 次：计算中（本轮 9/13）"
+    if state == "4":
+        total = min(13, 9 + progress)
+        return f"第 {attempt} 次：验证 {progress}/4（本轮 {total}/13）"
+    if state == "5":
+        return f"第 {attempt} 次：完成（本轮 13/13）"
+    if state == "6":
+        return f"第 {attempt} 次：失败"
+
+    target_text = values.get("target", "")
+    target = int(target_text) if target_text.isdigit() else None
+    return fmt_count(progress, target)
 
 
 @dataclass(frozen=True)
@@ -392,6 +422,15 @@ class AutoFrameAssembly:
         return self.frame.summary_received and self.waveform_complete()
 
 
+@dataclass
+class CaptureResult:
+    frame: CaptureFrame
+    output_dir: Path
+    status: str
+    message: str
+    command_error: Optional[str] = None
+
+
 class AutoStreamRecorder:
     """Reassemble, validate and persist auto-mode frames.
 
@@ -429,7 +468,7 @@ class AutoStreamRecorder:
         self.wave_file = self.wave_path.open("wb")
         self.summary_writer = csv.writer(self.summary_file)
         self.integrity_writer = csv.writer(self.integrity_file)
-        self.summary_writer.writerow(SUMMARY_COLUMNS)
+        self.summary_writer.writerow(SUMMARY_OUTPUT_COLUMNS)
         self.integrity_writer.writerow(STREAM_INTEGRITY_COLUMNS)
 
     def _assembly(self, frame_id: int, now: float) -> Optional[AutoFrameAssembly]:
@@ -492,13 +531,14 @@ class AutoStreamRecorder:
             return False
 
         now = time.monotonic()
+        received_at = time.time()
         assembly = self._assembly(frame_id, now)
         if assembly is None:
             return True
         if assembly.frame.summary_received:
             self.emit("log", message=f"#HOST,duplicate_summary,frame={frame_id}")
             return True
-        assembly.frame.accept_text(line)
+        assembly.frame.accept_text(line, received_time=received_at)
         assembly.summary_seen_monotonic = now
         self.emit(
             "stream_summary",
@@ -538,6 +578,7 @@ class AutoStreamRecorder:
         if frame.summary_received:
             self.summary_writer.writerow(
                 [frame.summary.get(name, "") for name in SUMMARY_COLUMNS]
+                + [format_pc_timestamp(frame.summary_received_time)]
             )
             self.summary_file.flush()
         if wave_saved:
@@ -565,6 +606,11 @@ class AutoStreamRecorder:
                 frame.stats.wave_bad_packets,
                 self.bad_datagrams,
                 f"{frame.end_time - frame.start_time:.6f}",
+                format_pc_timestamp(
+                    frame.summary_received_time
+                    if frame.summary_received_time is not None
+                    else frame.end_time
+                ),
             ]
         )
         self.integrity_file.flush()
@@ -617,7 +663,6 @@ class UdpWorker:
         recv_buffer: int,
         timeout_s: float,
         summary_grace_s: float,
-        split_channels: bool,
     ) -> None:
         self.events = events
         self.board_addr = (board_ip, board_port)
@@ -626,7 +671,6 @@ class UdpWorker:
         self.recv_buffer = recv_buffer
         self.timeout_s = timeout_s
         self.summary_grace_s = summary_grace_s
-        self.split_channels = split_channels
 
     def emit(self, kind: str, **payload: Any) -> None:
         payload["kind"] = kind
@@ -705,54 +749,160 @@ class UdpWorker:
                 sock.close()
 
     def run_capture(self) -> None:
-        self._run_capture_impl()
+        sock: Optional[socket.socket] = None
+        try:
+            sock = self.open_socket()
+            capture_dir = unique_output_dir(self.output_root, "capture")
+            result = self._receive_capture(sock, capture_dir, drain_before=True)
+            self.emit(
+                "capture_done",
+                frame=result.frame,
+                output_dir=result.output_dir,
+                status=result.status,
+                message=result.message,
+            )
+        except Exception as exc:
+            self.emit(
+                "error",
+                title="采集失败",
+                message=str(exc),
+                operation="capture",
+            )
+        finally:
+            if sock is not None:
+                sock.close()
+
+    def run_calibration(self) -> None:
+        """Run the complete discard + collect + verify calibration workflow."""
+        sock: Optional[socket.socket] = None
+        output_dir: Optional[Path] = None
+        captures = 0
+        status_values: Dict[str, str] = {}
+        try:
+            output_dir = unique_output_dir(self.output_root, "calibration")
+            sock = self.open_socket()
+            self.emit("log", message=f"#HOST,calibration_start,dir={output_dir}")
+            self.drain_text(sock, 0.1)
+            status_values = self._request_calibration_status(
+                sock, "CAL_START", timeout_s=2.0
+            )
+
+            while status_values.get("state") not in ("5", "6"):
+                state = status_values.get("state", "")
+                if state == "0":
+                    raise RuntimeError("板端校准意外回到 IDLE")
+                if captures >= CALIBRATION_MAX_CAPTURE_FRAMES:
+                    raise RuntimeError(
+                        "校准采集超过安全上限，已停止；请检查输入信号和板端状态"
+                    )
+
+                captures += 1
+                self.emit(
+                    "calibration_capture_start",
+                    capture_index=captures,
+                    output_dir=output_dir,
+                    status_values=status_values.copy(),
+                )
+                result = self._receive_capture(
+                    sock, output_dir, drain_before=False
+                )
+                frame = result.frame
+                self.emit(
+                    "calibration_frame_done",
+                    capture_index=captures,
+                    frame_id=frame.frame_id,
+                    summary=frame.summary.copy(),
+                    output_dir=result.output_dir,
+                    status=result.status,
+                    message=result.message,
+                    wave_missing=len(frame.missing_wave_chunks()),
+                    sensor_missing=len(frame.missing_sensor_chunks()),
+                )
+                if result.command_error is not None:
+                    raise RuntimeError(result.command_error)
+
+                # The firmware only pushes progress at stage transitions.
+                # Query after every frame so the GUI stays board-authoritative.
+                status_values = self._request_calibration_status(
+                    sock, "CAL_STATUS", timeout_s=1.5
+                )
+
+            success = (
+                status_values.get("state") == "5"
+                and status_values.get("valid") == "1"
+            )
+            self.emit(
+                "calibration_done",
+                success=success,
+                captures=captures,
+                attempts=status_values.get("attempt", "-"),
+                output_dir=output_dir,
+                status_values=status_values,
+            )
+        except Exception as exc:
+            self.emit(
+                "error",
+                title="校准失败",
+                message=str(exc),
+                operation="calibration",
+                output_dir=output_dir or self.output_root,
+            )
+        finally:
+            if sock is not None:
+                sock.close()
 
     def run_auto_stream(
         self,
-        stop_event: threading.Event,
+        record_stop_event: threading.Event,
+        monitor_stop_event: threading.Event,
         out_dir: Path,
-        startup_command: Optional[str] = None,
+        startup_command: str,
     ) -> None:
-        """Receive and persist auto frames until stop_event is set.
-
-        If startup_command is supplied, the receive socket is bound before
-        AUTO_START is sent, so the first automatically triggered frame cannot
-        be lost between two short-lived GUI workers.
-        """
+        """Start L2 monitoring, then receive and persist frames until stopped."""
         sock: Optional[socket.socket] = None
         recorder: Optional[AutoStreamRecorder] = None
         failure: Optional[Exception] = None
-        startup_pending = startup_command is not None
-        startup_deadline = time.monotonic() + 2.0 if startup_pending else None
+        startup_pending = True
+        startup_deadline = time.monotonic() + 2.0
+        startup_command_sent = False
+        startup_rejected = False
+        monitoring_started = False
+        monitoring_stopped = False
+
+        def mark_monitoring_started() -> None:
+            nonlocal monitoring_started, startup_pending
+            startup_pending = False
+            if not monitoring_started:
+                monitoring_started = True
+                self.emit("monitor_started")
+
         try:
             sock = self.open_socket()
             recorder = AutoStreamRecorder(out_dir, self.emit, self.summary_grace_s)
             self.emit("log", message=f"#HOST,auto_stream_start,dir={out_dir}")
-            if startup_command is not None:
-                self.send_command(sock, startup_command)
+            self.send_command(sock, startup_command)
+            startup_command_sent = True
 
-            while not stop_event.is_set():
+            while not record_stop_event.is_set() and not monitor_stop_event.is_set():
                 try:
                     data, _addr = sock.recvfrom(65535)
                 except socket.timeout:
                     recorder.sweep()
                     if (
-                        startup_pending
-                        and startup_deadline is not None
-                        and time.monotonic() >= startup_deadline
+                        startup_pending and time.monotonic() >= startup_deadline
                     ):
-                        raise RuntimeError("启动自动模式超时：未收到板端回复")
+                        raise RuntimeError("开始L2监测超时：未收到板端回复")
                     continue
                 except OSError:
-                    if stop_event.is_set():
+                    if record_stop_event.is_set() or monitor_stop_event.is_set():
                         break
                     raise
 
                 if data.startswith(WV32_MAGIC):
-                    startup_pending = False
+                    mark_monitoring_started()
                     recorder.accept_wave(data)
                 elif data.startswith(LS32_MAGIC):
-                    continue  # auto mode does not send LS32
+                    continue  # L2-triggered short frames do not send LS32
                 else:
                     text = parse_text_datagram(data)
                     if text is None:
@@ -762,19 +912,31 @@ class UdpWorker:
                         if not clean or clean.startswith("#CAPTURE"):
                             continue  # suppress per-frame trigger spam
                         if recorder.accept_summary(clean):
-                            startup_pending = False
+                            mark_monitoring_started()
                             continue
                         self.emit("log", message=clean)
                         if startup_pending:
                             if clean.startswith(("#ERR", "#BUSY")):
-                                raise RuntimeError(f"启动自动模式失败：{clean}")
+                                if clean.startswith("#ERR,auto_already_active"):
+                                    mark_monitoring_started()
+                                else:
+                                    startup_rejected = True
+                                raise RuntimeError(f"开始L2监测失败：{clean}")
                             if clean.startswith("#AUTO,STARTED"):
-                                startup_pending = False
+                                mark_monitoring_started()
                 recorder.sweep()
 
         except Exception as exc:
             failure = exc
         finally:
+            if monitor_stop_event.is_set() and sock is not None:
+                try:
+                    monitoring_stopped = self._stop_monitoring_on_socket(
+                        sock, recorder
+                    )
+                except Exception as exc:
+                    if failure is None:
+                        failure = exc
             if recorder is not None:
                 try:
                     recorder.close("stream_stopped" if failure is None else "stream_error")
@@ -783,8 +945,22 @@ class UdpWorker:
                         failure = exc
             if sock is not None:
                 sock.close()
+            # If AUTO_START was sent but all acknowledgements were lost, the
+            # board state is unknown. Keep controls locked and offer
+            # "Stop monitoring" instead of incorrectly assuming it is idle.
+            monitoring_active = (
+                monitoring_started
+                or (startup_command_sent and not startup_rejected)
+            ) and not monitoring_stopped
             if failure is not None:
-                self.emit("error", title="连续记录失败", message=str(failure))
+                self.emit(
+                    "error",
+                    title="L2监测记录失败",
+                    message=str(failure),
+                    operation="stream",
+                    monitoring_active=monitoring_active,
+                    output_dir=out_dir,
+                )
             else:
                 self.emit(
                     "stream_done",
@@ -793,108 +969,219 @@ class UdpWorker:
                     incomplete_frames=recorder.incomplete_count if recorder is not None else 0,
                     bad_datagrams=recorder.bad_datagrams if recorder is not None else 0,
                     output_dir=out_dir,
+                    monitoring_active=monitoring_active,
+                    monitoring_stopped=monitoring_stopped,
                 )
 
-    def _run_capture_impl(self) -> None:
+    def run_stop_monitoring(self) -> None:
         sock: Optional[socket.socket] = None
-        frame: Optional[CaptureFrame] = None
         try:
-            capture_dir = unique_output_dir(self.output_root, "capture")
-            frame = CaptureFrame(output_dir=capture_dir)
             sock = self.open_socket()
-
-            self.emit("log", message="#HOST,drain_before_capture")
-            self.drain_text(sock, 0.1)
-            self.send_command(sock, "CAPTURE")
-
-            deadline = time.time() + self.timeout_s
-            summary_deadline: Optional[float] = None
-            last_progress = 0.0
-
-            while time.time() < deadline:
-                try:
-                    data, _addr = sock.recvfrom(65535)
-                except socket.timeout:
-                    now = time.time()
-                    if summary_deadline is not None and now >= summary_deadline:
-                        break
-                    if now - last_progress >= 0.25:
-                        self.emit("progress", snapshot=frame_snapshot(frame))
-                        last_progress = now
-                    continue
-
-                if data.startswith(WV32_MAGIC):
-                    frame.accept_wave(data)
-                elif data.startswith(LS32_MAGIC):
-                    frame.accept_sensor(data)
-                else:
-                    text = parse_text_datagram(data)
-                    if text is None:
-                        frame.stats.unknown_packets += 1
-                        self.emit("log", message=f"#HOST,unknown_packet,len={len(data)}")
-                    else:
-                        had_summary = frame.summary_received
-                        frame.accept_text(text)
-                        for line in text.splitlines():
-                            clean = line.strip()
-                            if clean:
-                                self.emit("log", message=clean)
-                                if clean.startswith(("#ERR", "#BUSY")) and not frame.has_payload():
-                                    frame.end_time = time.time()
-                                    out_dir = frame.write_outputs(
-                                        split_channels=self.split_channels
-                                    )
-                                    self.emit(
-                                        "capture_done",
-                                        frame=frame,
-                                        output_dir=out_dir,
-                                        status="CHECK",
-                                        message=clean,
-                                    )
-                                    return
-                        if frame.summary_received and not had_summary:
-                            summary_deadline = time.time() + self.summary_grace_s
-
-                now = time.time()
-                if now - last_progress >= 0.15:
-                    self.emit("progress", snapshot=frame_snapshot(frame))
-                    last_progress = now
-
-                if frame.summary_received and frame.all_expected_chunks_received():
-                    break
-                if summary_deadline is not None and time.time() >= summary_deadline:
-                    break
-
-            if not frame.complete_enough():
-                frame.end_time = time.time()
-                frame.messages.append("#HOST,timeout_waiting_for_summary")
-                self.emit("log", message="#HOST,timeout_waiting_for_summary")
-
-            out_dir = frame.write_outputs(split_channels=self.split_channels)
-            wave_missing = len(frame.missing_wave_chunks())
-            sensor_missing = len(frame.missing_sensor_chunks())
-            status = (
-                "OK"
-                if frame.summary_received and wave_missing == 0 and sensor_missing == 0
-                else "CHECK"
-            )
-            self.emit(
-                "capture_done",
-                frame=frame,
-                output_dir=out_dir,
-                status=status,
-                message=(
-                    f"{status}: frame={frame.frame_id} "
-                    f"WV32={fmt_count(len(frame.wave_received), frame.wave_total_chunks)} "
-                    f"LS32={fmt_count(len(frame.sensor_received), frame.sensor_total_chunks)} "
-                    f"wave_missing={wave_missing} sensor_missing={sensor_missing}"
-                ),
-            )
+            stopped = self._stop_monitoring_on_socket(sock, recorder=None)
+            self.emit("monitor_stop_done", stopped=stopped)
         except Exception as exc:
-            self.emit("error", title="采集失败", message=str(exc))
+            self.emit(
+                "error",
+                title="停止L2监测失败",
+                message=str(exc),
+                operation="monitor_stop",
+                monitoring_active=True,
+            )
         finally:
             if sock is not None:
                 sock.close()
+
+    def _request_calibration_status(
+        self,
+        sock: socket.socket,
+        command: str,
+        timeout_s: float,
+    ) -> Dict[str, str]:
+        expected_event = {
+            "CAL_START": "STARTED",
+            "CAL_STATUS": "STATUS",
+        }.get(command)
+        self.send_command(sock, command)
+        deadline = time.monotonic() + timeout_s
+        next_retry = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            try:
+                data, _addr = sock.recvfrom(65535)
+            except socket.timeout:
+                if command == "CAL_STATUS" and time.monotonic() >= next_retry:
+                    self.send_command(sock, command)
+                    next_retry = time.monotonic() + 0.5
+                continue
+            if data.startswith((WV32_MAGIC, LS32_MAGIC)):
+                self.emit(
+                    "log",
+                    message=f"#HOST,unexpected_binary_during_{command.lower()},len={len(data)}",
+                )
+                continue
+            text = parse_text_datagram(data)
+            if text is None:
+                continue
+            for line in text.splitlines():
+                clean = line.strip()
+                if not clean:
+                    continue
+                self.emit("log", message=clean)
+                if clean.startswith(("#ERR", "#BUSY")):
+                    raise RuntimeError(f"{command} 失败：{clean}")
+                tag, values = parse_hash_kv_line(clean)
+                if tag == "CAL":
+                    # Stage-transition notifications can still be queued after
+                    # a capture. Wait for the explicit reply to this request so
+                    # a stale notification cannot trigger an extra frame.
+                    if expected_event and values.get("event") != expected_event:
+                        continue
+                    return values
+        raise RuntimeError(f"{command} 超时：未收到校准状态")
+
+    def _stop_monitoring_on_socket(
+        self,
+        sock: socket.socket,
+        recorder: Optional[AutoStreamRecorder],
+    ) -> bool:
+        deadline = time.monotonic() + 3.0
+        next_send = 0.0
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_send:
+                self.send_command(sock, "AUTO_STOP")
+                next_send = now + 0.15
+            try:
+                data, _addr = sock.recvfrom(65535)
+            except socket.timeout:
+                if recorder is not None:
+                    recorder.sweep()
+                continue
+
+            if data.startswith(WV32_MAGIC):
+                if recorder is not None:
+                    recorder.accept_wave(data)
+                continue
+            if data.startswith(LS32_MAGIC):
+                continue
+
+            text = parse_text_datagram(data)
+            if text is None:
+                continue
+            for line in text.splitlines():
+                clean = line.strip()
+                if not clean or clean.startswith("#CAPTURE"):
+                    continue
+                if recorder is not None and recorder.accept_summary(clean):
+                    continue
+                self.emit("log", message=clean)
+                if clean.startswith("#AUTO,STOPPED"):
+                    return True
+                if clean.startswith("#ERR,auto_not_active"):
+                    return True
+                if clean.startswith("#BUSY,capture_active"):
+                    continue
+                if clean.startswith("#ERR"):
+                    raise RuntimeError(clean)
+            if recorder is not None:
+                recorder.sweep()
+        raise RuntimeError("停止L2监测超时，板端可能仍在监测")
+
+    def _receive_capture(
+        self,
+        sock: socket.socket,
+        output_dir: Path,
+        drain_before: bool,
+    ) -> CaptureResult:
+        frame = CaptureFrame(output_dir=output_dir)
+        if drain_before:
+            self.emit("log", message="#HOST,drain_before_capture")
+            self.drain_text(sock, 0.1)
+        self.send_command(sock, "CAPTURE")
+
+        deadline = time.monotonic() + self.timeout_s
+        summary_deadline: Optional[float] = None
+        last_progress = 0.0
+        command_error: Optional[str] = None
+
+        while time.monotonic() < deadline:
+            try:
+                data, _addr = sock.recvfrom(65535)
+            except socket.timeout:
+                now = time.monotonic()
+                if summary_deadline is not None and now >= summary_deadline:
+                    break
+                if now - last_progress >= 0.25:
+                    self.emit("progress", snapshot=frame_snapshot(frame))
+                    last_progress = now
+                continue
+
+            if data.startswith(WV32_MAGIC):
+                frame.accept_wave(data)
+            elif data.startswith(LS32_MAGIC):
+                frame.accept_sensor(data)
+            else:
+                text = parse_text_datagram(data)
+                if text is None:
+                    frame.stats.unknown_packets += 1
+                    self.emit("log", message=f"#HOST,unknown_packet,len={len(data)}")
+                else:
+                    had_summary = frame.summary_received
+                    received_at = time.time()
+                    frame.accept_text(text, received_time=received_at)
+                    for line in text.splitlines():
+                        clean = line.strip()
+                        if not clean:
+                            continue
+                        self.emit("log", message=clean)
+                        if (
+                            clean.startswith(("#ERR", "#BUSY"))
+                            and not frame.has_payload()
+                        ):
+                            command_error = clean
+                    if frame.summary_received and not had_summary:
+                        summary_deadline = time.monotonic() + self.summary_grace_s
+
+            now = time.monotonic()
+            if now - last_progress >= 0.15:
+                self.emit("progress", snapshot=frame_snapshot(frame))
+                last_progress = now
+
+            if command_error is not None:
+                break
+            if frame.summary_received and frame.all_expected_chunks_received():
+                break
+            if summary_deadline is not None and time.monotonic() >= summary_deadline:
+                break
+
+        frame.end_time = time.time()
+        if command_error is None and not frame.complete_enough():
+            frame.messages.append("#HOST,timeout_waiting_for_summary")
+            self.emit("log", message="#HOST,timeout_waiting_for_summary")
+
+        saved_dir = frame.write_outputs()
+        wave_missing = len(frame.missing_wave_chunks())
+        sensor_missing = len(frame.missing_sensor_chunks())
+        status = (
+            "OK"
+            if command_error is None
+            and frame.summary_received
+            and wave_missing == 0
+            and sensor_missing == 0
+            else "CHECK"
+        )
+        message = command_error or (
+            f"{status}: frame={frame.frame_id} "
+            f"WV32={fmt_count(len(frame.wave_received), frame.wave_total_chunks)} "
+            f"LS32={fmt_count(len(frame.sensor_received), frame.sensor_total_chunks)} "
+            f"wave_missing={wave_missing} sensor_missing={sensor_missing}"
+        )
+        return CaptureResult(
+            frame=frame,
+            output_dir=saved_dir,
+            status=status,
+            message=message,
+            command_error=command_error,
+        )
 
 
 class DSHostGui(tk.Tk):
@@ -906,8 +1193,15 @@ class DSHostGui(tk.Tk):
 
         self.events: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self.busy = False
+        self.closing = False
         self.streaming = False
-        self.stream_stop_event: Optional[threading.Event] = None
+        self.monitoring = False
+        self.monitor_starting = False
+        self.record_stop_requested = False
+        self.monitor_stop_requested = False
+        self.stream_record_stop_event: Optional[threading.Event] = None
+        self.stream_monitor_stop_event: Optional[threading.Event] = None
+        self.monitor_worker: Optional[UdpWorker] = None
         self.stream_started_monotonic: Optional[float] = None
         # Live auto-mode wave view: payloads are placed at their sample offset
         # as WV32 packets arrive and redrawn throttled (~20 fps).
@@ -934,20 +1228,17 @@ class DSHostGui(tk.Tk):
         self.pc_port_var = tk.StringVar(value=str(DEFAULT_PC_PORT))
         self.output_root_var = tk.StringVar(value=str(DEFAULT_OUTPUT_ROOT))
         self.command_var = tk.StringVar(value="DMA_DEBUG")
-        self.split_channels_var = tk.BooleanVar(value=False)
         self.preview_points_var = tk.StringVar(value="1600")
         self.worker_state_var = tk.StringVar(value="空闲")
 
-        # Auto acquisition mode controls (defaults match firmware presets).
+        # L2-triggered acquisition controls; sample count is fixed by the GUI.
         self.auto_rpm_var = tk.StringVar(value="1000")
         self.auto_thr_var = tk.StringVar(value="32000")
-        self.auto_points_var = tk.StringVar(value="3125")
         self.auto_vars: Dict[str, tk.StringVar] = {
             "active": tk.StringVar(value="-"),
             "rpm": tk.StringVar(value="-"),
             "t_speed_ms": tk.StringVar(value="-"),
             "thr_um": tk.StringVar(value="-"),
-            "points": tk.StringVar(value="-"),
             "t_idle_ms": tk.StringVar(value="-"),
             "last_l2_um": tk.StringVar(value="-"),
             "triggers": tk.StringVar(value="-"),
@@ -996,8 +1287,10 @@ class DSHostGui(tk.Tk):
         self.sensor_progress_var = tk.DoubleVar(value=0.0)
 
         self.buttons: List[ttk.Button] = []
+        self.l2_parameter_entries: List[ttk.Entry] = []
         self._build_style()
         self._build_ui()
+        self._refresh_control_states()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(80, self._poll_events)
 
@@ -1076,11 +1369,26 @@ class DSHostGui(tk.Tk):
             ("Ping", "PING", 1.0),
             ("DMA 状态", "DMA_STATUS", 1.2),
             ("校准状态", "CAL_STATUS", 1.2),
-            ("开始校准", "CAL_START", 1.5),
         ):
             btn = ttk.Button(row2, text=text, command=lambda c=command, w=wait_s: self._start_command(c, w))
             btn.pack(side=tk.LEFT, padx=(0, 6))
             self.buttons.append(btn)
+
+        calibration_btn = ttk.Button(
+            row2,
+            text="开始校准",
+            command=self._start_calibration,
+        )
+        calibration_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.buttons.append(calibration_btn)
+
+        clear_calibration_btn = ttk.Button(
+            row2,
+            text="清除校准信息",
+            command=lambda: self._start_command("CAL_CLEAR", 1.2),
+        )
+        clear_calibration_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.buttons.append(clear_calibration_btn)
 
         capture_btn = ttk.Button(
             row2,
@@ -1090,12 +1398,6 @@ class DSHostGui(tk.Tk):
         )
         capture_btn.pack(side=tk.LEFT, padx=(8, 10))
         self.buttons.append(capture_btn)
-
-        ttk.Checkbutton(
-            row2,
-            text="拆分保存 A/B",
-            variable=self.split_channels_var,
-        ).pack(side=tk.LEFT, padx=(0, 12))
 
         ttk.Label(row2, text="自定义命令").pack(side=tk.LEFT, padx=(0, 4))
         ttk.Entry(row2, textvariable=self.command_var, width=20).pack(side=tk.LEFT, padx=(0, 4))
@@ -1111,46 +1413,36 @@ class DSHostGui(tk.Tk):
         row3 = ttk.Frame(bar)
         row3.grid(row=2, column=0, columnspan=13, sticky="ew", pady=(6, 0))
 
-        ttk.Label(row3, text="自动模式", style="Title.TLabel").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(row3, text="L2触发采集", style="Title.TLabel").pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(row3, text="转速 rpm").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Entry(row3, textvariable=self.auto_rpm_var, width=7).pack(side=tk.LEFT, padx=(0, 8))
+        rpm_entry = ttk.Entry(row3, textvariable=self.auto_rpm_var, width=7)
+        rpm_entry.pack(side=tk.LEFT, padx=(0, 8))
+        self.l2_parameter_entries.append(rpm_entry)
         ttk.Label(row3, text="阈值 um").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Entry(row3, textvariable=self.auto_thr_var, width=8).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(row3, text="点数").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Entry(row3, textvariable=self.auto_points_var, width=8).pack(side=tk.LEFT, padx=(0, 8))
+        threshold_entry = ttk.Entry(row3, textvariable=self.auto_thr_var, width=8)
+        threshold_entry.pack(side=tk.LEFT, padx=(0, 8))
+        self.l2_parameter_entries.append(threshold_entry)
 
-        for text, command in (
-            ("启动自动", self._start_auto),
-            ("应用参数", self._apply_auto_config),
-            ("停止自动", lambda: self._start_command("AUTO_STOP", 1.2, True)),
-            ("自动状态", lambda: self._start_command("AUTO_STATUS", 1.2, True)),
-        ):
-            btn = ttk.Button(row3, text=text, command=command)
-            btn.pack(side=tk.LEFT, padx=(0, 6))
-            self.buttons.append(btn)
-
-        start_and_stream_btn = ttk.Button(
+        self.start_monitor_btn = ttk.Button(
             row3,
-            text="启动并记录",
+            text="开始监测并记录",
             style="Primary.TButton",
-            command=lambda: self._start_auto_stream(start_auto=True),
+            command=self._start_auto_stream,
         )
-        start_and_stream_btn.pack(side=tk.LEFT, padx=(10, 6))
-        self.buttons.append(start_and_stream_btn)
+        self.start_monitor_btn.pack(side=tk.LEFT, padx=(10, 6))
 
-        stream_start_btn = ttk.Button(
-            row3,
-            text="仅开始记录",
-            command=lambda: self._start_auto_stream(start_auto=False),
-        )
-        stream_start_btn.pack(side=tk.LEFT, padx=(0, 6))
-        self.buttons.append(stream_start_btn)
-        # Stop button is managed manually: it must stay clickable while the
-        # stream worker keeps the rest of the UI busy.
         self.stream_stop_btn = ttk.Button(
             row3, text="停止记录", command=self._stop_auto_stream, state=tk.DISABLED
         )
         self.stream_stop_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.monitor_stop_btn = ttk.Button(
+            row3,
+            text="停止监测",
+            command=self._stop_l2_monitoring,
+            state=tk.DISABLED,
+        )
+        self.monitor_stop_btn.pack(side=tk.LEFT, padx=(0, 6))
 
     def _build_main_area(self) -> None:
         main = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
@@ -1206,7 +1498,9 @@ class DSHostGui(tk.Tk):
         ttk.Label(wave_top, text="波形预览", style="Title.TLabel").grid(
             row=0, column=0, sticky="w"
         )
-        ttk.Label(wave_top, text="抽样点数").grid(row=0, column=2, sticky="e", padx=(0, 4))
+        ttk.Label(wave_top, text="预览显示点数").grid(
+            row=0, column=2, sticky="e", padx=(0, 4)
+        )
         preview = ttk.Combobox(
             wave_top,
             textvariable=self.preview_points_var,
@@ -1227,7 +1521,7 @@ class DSHostGui(tk.Tk):
         self.wave_canvas.bind("<Configure>", lambda _event: self._redraw_wave())
 
     def _build_capture_panel(self, parent: ttk.Frame) -> None:
-        panel = ttk.LabelFrame(parent, text="采集信息（手动 / 自动）", padding=10)
+        panel = ttk.LabelFrame(parent, text="采集信息（手动 / L2触发）", padding=10)
         panel.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         panel.columnconfigure(1, weight=1)
 
@@ -1283,7 +1577,7 @@ class DSHostGui(tk.Tk):
             )
 
     def _build_auto_panel(self, parent: ttk.Frame) -> None:
-        panel = ttk.LabelFrame(parent, text="自动模式", padding=10)
+        panel = ttk.LabelFrame(parent, text="L2触发采集", padding=10)
         panel.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         panel.columnconfigure(1, weight=1)
 
@@ -1292,7 +1586,6 @@ class DSHostGui(tk.Tk):
             ("转速 rpm", "rpm"),
             ("t_speed ms", "t_speed_ms"),
             ("阈值 um", "thr_um"),
-            ("点数", "points"),
             ("t_idle ms", "t_idle_ms"),
             ("最近 L2 um", "last_l2_um"),
             ("触发次数", "triggers"),
@@ -1427,7 +1720,7 @@ class DSHostGui(tk.Tk):
         )
         ttk.Label(
             header,
-            text="最近 60 秒；me_2x_uV 经 15 帧（120 ms）滑动平均后换算",
+            text="最近 60 秒；me_2x_uV 经 15 个L2触发帧滑动平均后换算",
             foreground="#6b7280",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
@@ -1556,7 +1849,7 @@ class DSHostGui(tk.Tk):
                     f"{self.torque_estimator.count}/{self.torque_estimator.window_size}"
                 )
             else:
-                message = "等待自动连续采集的 summary 数据"
+                message = "等待L2触发采集的 summary 数据"
             canvas.create_text(
                 (left + right) / 2,
                 (top + bottom) / 2,
@@ -1661,15 +1954,28 @@ class DSHostGui(tk.Tk):
         self.log_text.configure(state=tk.DISABLED)
 
     def _on_close(self) -> None:
-        if self.streaming and self.stream_stop_event is not None:
-            self.stream_stop_event.set()
-            self.worker_state_var.set("正在安全结束记录…")
+        self.closing = True
+        if self.streaming and self.stream_monitor_stop_event is not None:
+            self.monitor_stop_requested = True
+            self.stream_monitor_stop_event.set()
+            self.worker_state_var.set("正在安全停止L2监测并结束记录…")
+            self._refresh_control_states()
+            self.after(100, self._finish_close)
+            return
+        if self.monitoring or self.monitor_starting:
+            self._stop_l2_monitoring()
+            self.after(100, self._finish_close)
+            return
+        if self.busy:
+            self.worker_state_var.set("正在等待当前事务安全结束…")
             self.after(100, self._finish_close)
             return
         self.destroy()
 
     def _finish_close(self) -> None:
-        if self.streaming:
+        if not self.closing:
+            return
+        if self.streaming or self.monitoring or self.monitor_starting or self.busy:
             self.after(100, self._finish_close)
         else:
             self.destroy()
@@ -1701,7 +2007,6 @@ class DSHostGui(tk.Tk):
             "recv_buffer": DEFAULT_RECV_BUFFER,
             "timeout_s": DEFAULT_TIMEOUT_S,
             "summary_grace_s": DEFAULT_SUMMARY_GRACE_S,
-            "split_channels": self.split_channels_var.get(),
         }
 
     def _make_worker(self) -> Optional[UdpWorker]:
@@ -1713,9 +2018,49 @@ class DSHostGui(tk.Tk):
     def _set_busy(self, busy: bool, state: str) -> None:
         self.busy = busy
         self.worker_state_var.set(state)
-        button_state = tk.DISABLED if busy else tk.NORMAL
+        self._refresh_control_states()
+
+    def _refresh_control_states(self) -> None:
+        general_locked = (
+            self.busy
+            or self.monitoring
+            or self.monitor_starting
+            or self.streaming
+        )
+        button_state = tk.DISABLED if general_locked else tk.NORMAL
         for button in self.buttons:
             button.configure(state=button_state)
+
+        parameter_state = (
+            tk.DISABLED
+            if self.monitoring or self.monitor_starting or self.streaming
+            else tk.NORMAL
+        )
+        for entry in self.l2_parameter_entries:
+            entry.configure(state=parameter_state)
+
+        can_start = not general_locked
+        self.start_monitor_btn.configure(
+            state=tk.NORMAL if can_start else tk.DISABLED
+        )
+        self.stream_stop_btn.configure(
+            state=(
+                tk.NORMAL
+                if self.streaming
+                and self.monitoring
+                and not self.record_stop_requested
+                and not self.monitor_stop_requested
+                else tk.DISABLED
+            )
+        )
+        self.monitor_stop_btn.configure(
+            state=(
+                tk.NORMAL
+                if (self.monitoring or self.monitor_starting or self.streaming)
+                and not self.monitor_stop_requested
+                else tk.DISABLED
+            )
+        )
 
     def _start_thread(self, target: Any, state: str) -> None:
         if self.busy:
@@ -1753,68 +2098,93 @@ class DSHostGui(tk.Tk):
         self._reset_capture_views("手动单帧")
         self._start_thread(worker.run_capture, "采集中")
 
+    def _start_calibration(self) -> None:
+        worker = self._make_worker()
+        if worker is None:
+            return
+        self._reset_capture_views("校准事务")
+        self.cal_vars["progress"].set("准备中")
+        self._start_thread(worker.run_calibration, "正在执行完整校准事务…")
+
     def _read_auto_config(self) -> Optional[AutoConfig]:
         try:
             return parse_auto_config(
                 self.auto_rpm_var.get(),
                 self.auto_thr_var.get(),
-                self.auto_points_var.get(),
             )
         except ValueError as exc:
-            messagebox.showerror("参数错误", f"自动模式参数无效: {exc}")
+            messagebox.showerror("参数错误", f"L2触发参数无效: {exc}")
             return None
 
-    def _start_auto(self) -> None:
+    def _start_auto_stream(self) -> None:
+        if self.busy or self.streaming or self.monitoring or self.monitor_starting:
+            return
         config = self._read_auto_config()
-        if config is not None:
-            self._start_command(config.command("AUTO_START"), 1.5, True)
-
-    def _apply_auto_config(self) -> None:
-        config = self._read_auto_config()
-        if config is not None:
-            self._start_command(config.command("AUTO_CFG"), 1.2, True)
-
-    def _start_auto_stream(self, start_auto: bool = False) -> None:
-        if self.busy or self.streaming:
+        if config is None:
             return
         worker = self._make_worker()
         if worker is None:
             return
-        startup_command: Optional[str] = None
-        if start_auto:
-            config = self._read_auto_config()
-            if config is None:
-                return
-            startup_command = config.command("AUTO_START")
-        out_dir = unique_output_dir(
-            Path(self.output_root_var.get()).expanduser(),
-            "auto_log",
-        )
-        self._reset_capture_views("自动连续")
+        try:
+            out_dir = unique_output_dir(
+                Path(self.output_root_var.get()).expanduser(),
+                "auto_log",
+            )
+        except Exception as exc:
+            messagebox.showerror("输出目录错误", str(exc))
+            return
+
+        self._reset_capture_views("L2触发连续")
         self.info_vars["out_dir"].set(str(out_dir))
-        self.info_vars["sensor_chunks"].set("自动模式不回传")
-        self.info_vars["sensor_records"].set("自动模式不回传")
+        self.info_vars["sensor_chunks"].set("L2触发模式不回传")
+        self.info_vars["sensor_records"].set("L2触发模式不回传")
         self.stream_started_monotonic = time.monotonic()
-        stop_event = threading.Event()
-        self.stream_stop_event = stop_event
+        record_stop_event = threading.Event()
+        monitor_stop_event = threading.Event()
+        self.stream_record_stop_event = record_stop_event
+        self.stream_monitor_stop_event = monitor_stop_event
+        self.monitor_worker = worker
         self.streaming = True
-        self._set_busy(True, "连续记录中 0 帧")
-        self.stream_stop_btn.configure(state=tk.NORMAL)
+        self.monitor_starting = True
+        self.monitoring = False
+        self.record_stop_requested = False
+        self.monitor_stop_requested = False
+        self._set_busy(True, "正在开始L2监测并记录…")
         thread = threading.Thread(
             target=lambda: worker.run_auto_stream(
-                stop_event,
+                record_stop_event,
+                monitor_stop_event,
                 out_dir,
-                startup_command=startup_command,
+                startup_command=config.command("AUTO_START"),
             ),
             daemon=True,
         )
         thread.start()
 
     def _stop_auto_stream(self) -> None:
-        if self.stream_stop_event is not None:
-            self.stream_stop_event.set()
-            self.stream_stop_btn.configure(state=tk.DISABLED)
+        if self.streaming and self.stream_record_stop_event is not None:
+            self.record_stop_requested = True
+            self.stream_record_stop_event.set()
             self.worker_state_var.set("正在停止记录…")
+            self._refresh_control_states()
+
+    def _stop_l2_monitoring(self) -> None:
+        if self.monitor_stop_requested:
+            return
+        if self.streaming and self.stream_monitor_stop_event is not None:
+            self.monitor_stop_requested = True
+            self.stream_monitor_stop_event.set()
+            self.worker_state_var.set("正在停止L2监测并结束记录…")
+            self._refresh_control_states()
+            return
+        if not self.monitoring and not self.monitor_starting:
+            return
+
+        worker = self.monitor_worker or self._make_worker()
+        if worker is None:
+            return
+        self.monitor_stop_requested = True
+        self._start_thread(worker.run_stop_monitoring, "正在停止L2监测…")
 
     def _reset_capture_views(self, mode: str = "-") -> None:
         self.current_frame = None
@@ -1868,6 +2238,54 @@ class DSHostGui(tk.Tk):
             self._append_log(message)
             self._show_frame(event["frame"], Path(event["output_dir"]))
             self._set_busy(False, f"完成 {event.get('status', '')}".strip())
+        elif kind == "calibration_capture_start":
+            values = event.get("status_values", {})
+            self.info_vars["mode"].set("校准事务")
+            self.info_vars["out_dir"].set(str(event.get("output_dir", "-")))
+            self.cal_vars["progress"].set(format_calibration_progress(values))
+            self.worker_state_var.set(
+                f"校准中：自动采集第 {event.get('capture_index', 0)} 帧"
+            )
+        elif kind == "calibration_frame_done":
+            summary = event.get("summary", {})
+            self._append_log(str(event.get("message", "calibration frame done")))
+            self.info_vars["frame_id"].set(str(event.get("frame_id", "-")))
+            self.info_vars["summary"].set("已收到" if summary else "未收到")
+            self.info_vars["missing"].set(
+                f"WV32 {event.get('wave_missing', '?')}，"
+                f"LS32 {event.get('sensor_missing', '?')}"
+            )
+            self.info_vars["out_dir"].set(str(event.get("output_dir", "-")))
+            if summary:
+                self._populate_summary(summary)
+                self._refresh_summary_labels(summary)
+            self.worker_state_var.set(
+                f"校准中：已完成 {event.get('capture_index', 0)} 帧"
+            )
+        elif kind == "calibration_done":
+            values = event.get("status_values", {})
+            self.cal_vars["progress"].set(format_calibration_progress(values))
+            self.info_vars["out_dir"].set(str(event.get("output_dir", "-")))
+            success = bool(event.get("success"))
+            captures = event.get("captures", 0)
+            attempts = event.get("attempts", "-")
+            if success:
+                state = f"校准完成：{attempts} 次尝试，共 {captures} 帧"
+                self._append_log(f"#HOST,calibration_done,{state}")
+                self._set_busy(False, state)
+                if not self.closing:
+                    messagebox.showinfo("校准完成", state)
+            else:
+                state = f"校准未通过：{attempts} 次尝试，共 {captures} 帧"
+                self._append_log(f"#HOST,calibration_failed,{state}")
+                self._set_busy(False, state)
+                if not self.closing:
+                    messagebox.showwarning("校准未通过", state)
+        elif kind == "monitor_started":
+            self.monitor_starting = False
+            self.monitoring = True
+            self.worker_state_var.set("L2监测并记录中")
+            self._refresh_control_states()
         elif kind == "stream_wave":
             self._ingest_stream_wave(event)
         elif kind == "stream_summary":
@@ -1908,7 +2326,7 @@ class DSHostGui(tk.Tk):
                 f"BAD {event.get('bad_datagrams', 0)}"
             )
             self.worker_state_var.set(
-                f"连续记录：完整 {complete_frames}，不完整 {incomplete_frames}"
+                f"L2记录：完整 {complete_frames}，不完整 {incomplete_frames}"
             )
             if not complete:
                 self._append_log(
@@ -1917,9 +2335,15 @@ class DSHostGui(tk.Tk):
                 )
         elif kind == "stream_done":
             self.streaming = False
-            self.stream_stop_event = None
+            self.monitor_starting = False
+            self.monitoring = bool(event.get("monitoring_active"))
+            self.stream_record_stop_event = None
+            self.stream_monitor_stop_event = None
             self.stream_started_monotonic = None
-            self.stream_stop_btn.configure(state=tk.DISABLED)
+            self.record_stop_requested = False
+            self.monitor_stop_requested = False
+            if not self.monitoring:
+                self.monitor_worker = None
             self._append_log(
                 f"#HOST,auto_stream_done,frames={event.get('frames', 0)},"
                 f"complete={event.get('complete_frames', 0)},"
@@ -1927,16 +2351,44 @@ class DSHostGui(tk.Tk):
                 f"bad={event.get('bad_datagrams', 0)},"
                 f"dir={event.get('output_dir', '')}"
             )
-            self._set_busy(False, "空闲")
+            state = "L2监测中（未记录）" if self.monitoring else "空闲"
+            self._set_busy(False, state)
+        elif kind == "monitor_stop_done":
+            self.monitoring = False
+            self.monitor_starting = False
+            self.monitor_stop_requested = False
+            self.monitor_worker = None
+            self._set_busy(False, "L2监测已停止")
         elif kind == "error":
             self._append_log(f"#HOST,error,{event.get('message', '')}")
-            if self.streaming:
+            operation = str(event.get("operation", ""))
+            if operation == "stream" or self.streaming:
                 self.streaming = False
-                self.stream_stop_event = None
+                self.stream_record_stop_event = None
+                self.stream_monitor_stop_event = None
                 self.stream_started_monotonic = None
-                self.stream_stop_btn.configure(state=tk.DISABLED)
-            self._set_busy(False, "空闲")
-            messagebox.showerror(str(event.get("title", "错误")), str(event.get("message", "")))
+                self.record_stop_requested = False
+                self.monitor_stop_requested = False
+                self.monitor_starting = False
+                self.monitoring = bool(event.get("monitoring_active"))
+                if not self.monitoring:
+                    self.monitor_worker = None
+            if operation == "monitor_stop":
+                self.monitor_stop_requested = False
+                self.monitoring = bool(event.get("monitoring_active", True))
+            state = "L2监测中（未记录）" if self.monitoring else "空闲"
+            self._set_busy(False, state)
+            if self.closing and self.monitoring:
+                self.closing = False
+                messagebox.showerror(
+                    "无法安全关闭",
+                    "停止L2监测失败，程序保持打开。请重试“停止监测”。",
+                )
+            elif not self.closing:
+                messagebox.showerror(
+                    str(event.get("title", "错误")),
+                    str(event.get("message", "")),
+                )
 
     def _update_progress(self, snapshot: Dict[str, Any]) -> None:
         frame_id = snapshot.get("frame_id")
@@ -2019,6 +2471,11 @@ class DSHostGui(tk.Tk):
         if tag != "CAL":
             return
 
+        if values.get("event") == "CLEARED":
+            for var in self.cal_vars.values():
+                var.set("-")
+            self._reset_torque()
+
         state = values.get("state", "")
         state_name = values.get("state_name") or CAL_STATE_NAMES.get(state, "UNKNOWN")
         if state:
@@ -2028,12 +2485,7 @@ class DSHostGui(tk.Tk):
         if "attempt" in values:
             self.cal_vars["attempt"].set(values["attempt"])
         if "progress" in values or "target" in values:
-            self.cal_vars["progress"].set(
-                fmt_count(
-                    int(values.get("progress", "0") or "0"),
-                    int(values["target"]) if values.get("target") else None,
-                )
-            )
+            self.cal_vars["progress"].set(format_calibration_progress(values))
         for key in ("gain_a_ppm", "gain_b_ppm", "verify_std_uV", "verify_drift_uV"):
             if key in values:
                 self.cal_vars[key].set(values[key])
@@ -2045,14 +2497,22 @@ class DSHostGui(tk.Tk):
         CFG_OK/AUTO_STATUS replies all share the #AUTO tag)."""
         if "STARTED" in line:
             self.auto_vars["active"].set("是")
+            self.monitor_starting = False
+            self.monitoring = True
         if "STOPPED" in line:
             self.auto_vars["active"].set("否")
-        for key in ("rpm", "t_speed_ms", "thr_um", "points", "t_idle_ms",
+            self.monitor_starting = False
+            self.monitoring = False
+        for key in ("rpm", "t_speed_ms", "thr_um", "t_idle_ms",
                     "last_l2_um", "triggers"):
             if key in values:
                 self.auto_vars[key].set(values[key])
         if "active" in values:
             self.auto_vars["active"].set(fmt_bool(values["active"]))
+            self.monitoring = values["active"] == "1"
+            if not self.monitoring:
+                self.monitor_starting = False
+        self._refresh_control_states()
 
     def _ingest_stream_wave(self, event: Dict[str, Any]) -> None:
         fid = event.get("frame_id")

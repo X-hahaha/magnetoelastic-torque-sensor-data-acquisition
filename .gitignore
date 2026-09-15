@@ -80,6 +80,7 @@ DS_system/DS_system.sdk/RemoteSystemsTempFiles/
 DS_system/DS_system.sdk/SDK.log
 DS_system/DS_system.sdk/ps_system_wrapper.hdf
 problem/
+DS_system/DS_system.sdk/FSBL/
 
 # OS
 .DS_Store
