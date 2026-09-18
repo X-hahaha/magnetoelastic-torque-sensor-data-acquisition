@@ -190,8 +190,8 @@
         <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_m1_axis_bridge_0_1/ps_system_m1_axis_bridge_0_1.xci">
           <Proxy FileSetName="ps_system_m1_axis_bridge_0_1"/>
         </CompFileExtendedInfo>
-        <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_processing_system7_0_0/ps_system_processing_system7_0_0.xci">
-          <Proxy FileSetName="ps_system_processing_system7_0_0"/>
+        <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_hp_smartconnect_0_0/ps_system_hp_smartconnect_0_0.xci">
+          <Proxy FileSetName="ps_system_hp_smartconnect_0_0"/>
         </CompFileExtendedInfo>
         <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_system_ila_0_0/ps_system_system_ila_0_0.xci">
           <Proxy FileSetName="ps_system_system_ila_0_0"/>
@@ -199,61 +199,21 @@
         <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_axi_dma_0_0/ps_system_axi_dma_0_0.xci">
           <Proxy FileSetName="ps_system_axi_dma_0_0"/>
         </CompFileExtendedInfo>
+        <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_laser_axi_regs_0_0/ps_system_laser_axi_regs_0_0.xci">
+          <Proxy FileSetName="ps_system_laser_axi_regs_0_0"/>
+        </CompFileExtendedInfo>
         <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_smartconnect_0_0/ps_system_smartconnect_0_0.xci">
           <Proxy FileSetName="ps_system_smartconnect_0_0"/>
         </CompFileExtendedInfo>
         <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_pl_capture_logic_0_0/ps_system_pl_capture_logic_0_0.xci">
           <Proxy FileSetName="ps_system_pl_capture_logic_0_0"/>
         </CompFileExtendedInfo>
-        <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_hp_smartconnect_0_0/ps_system_hp_smartconnect_0_0.xci">
-          <Proxy FileSetName="ps_system_hp_smartconnect_0_0"/>
-        </CompFileExtendedInfo>
-        <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_laser_axi_regs_0_0/ps_system_laser_axi_regs_0_0.xci">
-          <Proxy FileSetName="ps_system_laser_axi_regs_0_0"/>
+        <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_processing_system7_0_0/ps_system_processing_system7_0_0.xci">
+          <Proxy FileSetName="ps_system_processing_system7_0_0"/>
         </CompFileExtendedInfo>
       </File>
       <File Path="$PSRCDIR/sources_1/bd/ps_system/hdl/ps_system_wrapper.v">
         <FileInfo>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PSRCDIR/sources_1/imports/adc_pp_modified/adc_burst_capture_2ch.v">
-        <FileInfo>
-          <Attr Name="AutoDisabled" Val="1"/>
-          <Attr Name="ImportPath" Val="$PPRDIR/../../../../../Vivado/project2/gpt/2026-7-10-gpt/gpt_src/2026-7-16-14-41gptsrc/adc_pp_modified_sources/adc_pp_modified/adc_burst_capture_2ch.v"/>
-          <Attr Name="ImportTime" Val="1784184078"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PSRCDIR/sources_1/imports/src/cdc_pulse_sync.v">
-        <FileInfo>
-          <Attr Name="AutoDisabled" Val="1"/>
-          <Attr Name="ImportPath" Val="$PPRDIR/../pl_zynq7020_periodic_db_sources/src/cdc_pulse_sync.v"/>
-          <Attr Name="ImportTime" Val="1783649805"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PSRCDIR/sources_1/imports/src/sdp_bram.v">
-        <FileInfo>
-          <Attr Name="AutoDisabled" Val="1"/>
-          <Attr Name="ImportPath" Val="$PPRDIR/../pl_zynq7020_periodic_db_sources/src/sdp_bram.v"/>
-          <Attr Name="ImportTime" Val="1783649805"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PSRCDIR/sources_1/imports/src/debug_readout_sequencer.v">
-        <FileInfo>
-          <Attr Name="AutoDisabled" Val="1"/>
-          <Attr Name="ImportPath" Val="$PPRDIR/../pl_zynq7020_periodic_db_sources/src/debug_readout_sequencer.v"/>
-          <Attr Name="ImportTime" Val="1783649805"/>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
@@ -281,14 +241,6 @@
     </FileSet>
     <FileSet Name="sim_1" Type="SimulationSrcs" RelSrcDir="$PSRCDIR/sim_1">
       <Filter Type="Srcs"/>
-      <File Path="$PSRCDIR/sim_1/m2/tb_fr16_adc_frame_axis.sv">
-        <FileInfo>
-          <Attr Name="AutoDisabled" Val="1"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
       <Config>
         <Option Name="DesignMode" Val="RTL"/>
         <Option Name="TopModule" Val="pl_capture_logic"/>
