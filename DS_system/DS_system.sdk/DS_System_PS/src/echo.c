@@ -1,11 +1,11 @@
 /*
- * echo.c - AD9268 host-triggered long capture over UDP.
+ * echo.c - AD9268 host-triggered/runtime-length capture over UDP.
  *
  * Zynq-7000 / Vivado SDK 2018.3 / standalone lwIP raw API.
  * Keep main.c unchanged.
  *
  * CAPTURE command flow:
- *   1) Arm AXI DMA S2MM SG descriptors for one FR16 long frame.
+ *   1) Arm AXI DMA S2MM SG descriptors for one FR16 frame.
  *   2) Trigger PL through AXI-Lite register 0x38.
  *   3) Wait for DDR frame completion.
  *   4) Send all raw 16-bit two-channel waveform samples in WV32 UDP chunks.
@@ -13,7 +13,8 @@
  *   6) Send the CSV summary after waveform and timeline.
  *
  * Added zero-load calibration commands:
- *   CAL_START, CAL_ABORT, CAL_CLEAR, CAL_STATUS, PING
+ *   CAL_START_SHORT (3125 points), CAL_START (same), CAL_ABORT,
+ *   CAL_CLEAR, CAL_STATUS, PING
  *
  * Added auto acquisition mode (keyphasor-like L2 trigger, short frames,
  * summary + waveform only, requires calibration READY):
@@ -185,12 +186,13 @@
 #define ADC_MODULE_FS_UVPP_D          9000000.0
 #define ADC_FULL_SCALE_CODES_D        65536.0
 
-/* Manual long-frame calibration: PC sends one CAPTURE per calibration frame. */
-#define CAL_DISCARD_FRAMES            1U
-#define CAL_COLLECT_FRAMES            8U
-#define CAL_VERIFY_FRAMES             4U
+/* Ten 50 kHz periods at 15.625 MSPS; host drives the whole transaction. */
+#define CAL_SAMPLE_COUNT              3125U
+#define CAL_DISCARD_FRAMES            8U
+#define CAL_COLLECT_FRAMES            96U
+#define CAL_VERIFY_FRAMES             96U
 #define CAL_MAX_RETRIES               3U
-#define CAL_MAX_INVALID_FRAMES        8U
+#define CAL_MAX_INVALID_FRAMES        32U
 
 /* Verification thresholds. */
 #define CAL_VERIFY_MEAN_LIMIT_UV       100L  /* 0.100 mV */
@@ -889,6 +891,15 @@ static int fr16_capture_start(void)
         return XST_FAILURE;
     }
 
+    /* Change length only while IDLE, never during serialization of the final
+     * verification frame (which may have already changed CAL state to READY). */
+    if (!g_auto.active) {
+        int calibrating = (g_cal.state == CAL_STATE_DISCARD) ||
+                          (g_cal.state == CAL_STATE_COLLECT) ||
+                          (g_cal.state == CAL_STATE_COMPUTE) ||
+                          (g_cal.state == CAL_STATE_VERIFY);
+        (void)fr16_set_sample_count(calibrating ? CAL_SAMPLE_COUNT : ADC_SAMPLE_COUNT);
+    }
     status = fr16_prepare_capture_bds();
     if (status != XST_SUCCESS) {
         (void)udp_send_text("#ERR,capture_dma_arm_failed\r\n");
@@ -1479,7 +1490,7 @@ static const char *cal_state_name(calibration_state_t state)
 
 static void calibration_send_status(const char *event)
 {
-    char line[320];
+    char line[512];
     u32 progress = 0U;
     u32 target = 0U;
     int n;
@@ -1500,7 +1511,8 @@ static void calibration_send_status(const char *event)
         "attempt=%u,progress=%u,target=%u,invalid=%u,"
         "gain_a_ppm=%ld,gain_b_ppm=%ld,"
         "zero_a_uVpp=%ld,zero_b_uVpp=%ld,"
-        "verify_mean_uV=%ld,verify_std_uV=%ld,verify_drift_uV=%ld\r\n",
+        "verify_mean_uV=%ld,verify_std_uV=%ld,verify_drift_uV=%ld,"
+        "cal_protocol=2,points=%u,discard_frames=%u,collect_frames=%u,verify_frames=%u\r\n",
         (event != NULL) ? event : "STATUS",
         (unsigned int)g_cal.state,
         cal_state_name(g_cal.state),
@@ -1515,7 +1527,11 @@ static void calibration_send_status(const char *event)
         (long)adc_code_double_to_uVpp(g_cal.zero_mean_b_code),
         (long)g_cal.verify_mean_uV,
         (long)g_cal.verify_std_uV,
-        (long)g_cal.verify_drift_uV);
+        (long)g_cal.verify_drift_uV,
+        (unsigned int)CAL_SAMPLE_COUNT,
+        (unsigned int)CAL_DISCARD_FRAMES,
+        (unsigned int)CAL_COLLECT_FRAMES,
+        (unsigned int)CAL_VERIFY_FRAMES);
 
     if ((n > 0) && (n < (int)sizeof(line))) {
         (void)udp_send_text(line);
@@ -2256,12 +2272,15 @@ static void udp_command_recv(void *arg,
             (void)fr16_capture_start();
         }
 
-    } else if (strcmp(cmd, "CAL_START") == 0) {
+    } else if ((strcmp(cmd, "CAL_START") == 0) ||
+               (strcmp(cmd, "CAL_START_SHORT") == 0)) {
         if (g_pl_reset_active) {
             (void)udp_send_text("#ERR,pl_reset_active\r\n");
         } else if (g_auto.active) {
-            /* Calibration needs manual long frames. */
+            /* Calibration uses host-driven short frames, never L2 triggers. */
             (void)udp_send_text("#ERR,auto_active\r\n");
+        } else if (g_capture_state != CAPTURE_STATE_IDLE) {
+            (void)udp_send_text("#BUSY,capture_active\r\n");
         } else {
             calibration_start_new();
         }
@@ -2280,9 +2299,17 @@ static void udp_command_recv(void *arg,
         auto_mode_send_status();
 
     } else if (strcmp(cmd, "CAL_ABORT") == 0) {
+        if (g_capture_state != CAPTURE_STATE_IDLE || g_auto.active) {
+            (void)udp_send_text("#BUSY,capture_active\r\n");
+            return;
+        }
         calibration_abort();
 
     } else if (strcmp(cmd, "CAL_CLEAR") == 0) {
+        if (g_capture_state != CAPTURE_STATE_IDLE) {
+            (void)udp_send_text("#BUSY,capture_active\r\n");
+            return;
+        }
         /* Clearing calibration invalidates the auto-mode entry condition;
          * stop auto mode so it must be re-entered after a fresh calibration. */
         if (g_auto.active) {

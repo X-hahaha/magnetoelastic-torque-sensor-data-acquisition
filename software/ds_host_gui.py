@@ -10,7 +10,6 @@ accepting a waveform as experiment data.
 
 from __future__ import annotations
 
-import csv
 import math
 import os
 import queue
@@ -19,12 +18,14 @@ import struct
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, TextIO, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+from ds_torque import TorqueModel, validate_settings
+from ds_monitor import RecordingSession, run_monitor
 
 from ds_host import (
     ADC_SAMPLE_COUNT,
@@ -36,7 +37,6 @@ from ds_host import (
     LS32_MAGIC,
     LS32_RECORD_BYTES,
     SUMMARY_COLUMNS,
-    SUMMARY_OUTPUT_COLUMNS,
     TIMELINE_COLUMNS,
     WAVE_HEADER_BYTES,
     WV32_MAGIC,
@@ -59,7 +59,7 @@ AUTO_MIN_POINTS = 16
 AUTO_MAX_POINTS = ADC_SAMPLE_COUNT
 AUTO_FRAME_STALE_S = 2.0
 WAVE_PREVIEW_POINTS = 3000
-CALIBRATION_MAX_CAPTURE_FRAMES = 64
+CALIBRATION_MAX_CAPTURE_FRAMES = 2000
 
 # AD9268 samples are signed 16-bit codes spanning the configured 9.0 Vpp input
 # range.  Keep this conversion identical to plot_capture_frame.m.
@@ -67,13 +67,7 @@ ADC_FULL_SCALE_VPP = 9.0
 ADC_CODE_RANGE = 65536.0
 ADC_VOLTS_PER_CODE = ADC_FULL_SCALE_VPP / ADC_CODE_RANGE
 
-# Torque calibration from the supplied 标定报告.md. The estimator averages 15
-# received trigger frames before applying the calibration. Its time span follows
-# the active trigger interval rather than assuming the report's 125 Hz rate.
-TORQUE_GAIN_NM_PER_UV = 0.4424
-TORQUE_ZERO_UV = 1118.9
-TORQUE_ZERO_NM = 86.4
-TORQUE_AVERAGE_FRAMES = 15
+# Models and filtering live in ds_torque.py; no implicit historical zero point.
 TORQUE_HISTORY_SECONDS = 60.0
 TORQUE_HISTORY_MAX_POINTS = 7500
 
@@ -166,36 +160,6 @@ def adc_code_to_volts(code: int) -> float:
     return code * ADC_VOLTS_PER_CODE
 
 
-def calibrated_torque_nm(me_2x_uV: float) -> float:
-    return TORQUE_GAIN_NM_PER_UV * (me_2x_uV - TORQUE_ZERO_UV) + TORQUE_ZERO_NM
-
-
-class MovingTorqueEstimator:
-    """Apply the report's moving average and torque calibration."""
-
-    def __init__(self, window_size: int = TORQUE_AVERAGE_FRAMES) -> None:
-        if window_size <= 0:
-            raise ValueError("扭矩平均窗口必须大于 0")
-        self.window_size = window_size
-        self._me_values: Deque[float] = deque(maxlen=window_size)
-
-    @property
-    def count(self) -> int:
-        return len(self._me_values)
-
-    @property
-    def ready(self) -> bool:
-        return self.count == self.window_size
-
-    def reset(self) -> None:
-        self._me_values.clear()
-
-    def add(self, me_2x_uV: float) -> float:
-        if not math.isfinite(me_2x_uV):
-            raise ValueError("me_2x_uV 必须是有限数值")
-        self._me_values.append(me_2x_uV)
-        mean_uV = sum(self._me_values) / len(self._me_values)
-        return calibrated_torque_nm(mean_uV)
 
 
 def unique_output_dir(root: Path, prefix: str) -> Path:
@@ -341,7 +305,7 @@ def parse_auto_config(
 
 
 def format_calibration_progress(values: Dict[str, str]) -> str:
-    """Show board stage progress in the complete 1 + 8 + 4 transaction."""
+    """Use firmware-reported targets, including the short-frame protocol."""
     state = values.get("state", "")
     attempt = values.get("attempt", "") or "-"
     try:
@@ -349,20 +313,24 @@ def format_calibration_progress(values: Dict[str, str]) -> str:
     except ValueError:
         progress = 0
 
+    discard = int(values.get("discard_frames", "8"))
+    collect = int(values.get("collect_frames", "96"))
+    verify = int(values.get("verify_frames", "96"))
+    count = discard + collect + verify
     if state == "0":
         return "未开始"
     if state == "1":
-        return f"第 {attempt} 次：丢弃 {progress}/1（本轮 {progress}/13）"
+        return f"第 {attempt} 次：丢弃 {progress}/{discard}（本轮 {progress}/{count}）"
     if state == "2":
-        total = min(13, 1 + progress)
-        return f"第 {attempt} 次：采集 {progress}/8（本轮 {total}/13）"
+        total = min(count, discard + progress)
+        return f"第 {attempt} 次：采集 {progress}/{collect}（本轮 {total}/{count}）"
     if state == "3":
-        return f"第 {attempt} 次：计算中（本轮 9/13）"
+        return f"第 {attempt} 次：计算中（本轮 {discard + collect}/{count}）"
     if state == "4":
-        total = min(13, 9 + progress)
-        return f"第 {attempt} 次：验证 {progress}/4（本轮 {total}/13）"
+        total = min(count, discard + collect + progress)
+        return f"第 {attempt} 次：验证 {progress}/{verify}（本轮 {total}/{count}）"
     if state == "5":
-        return f"第 {attempt} 次：完成（本轮 13/13）"
+        return f"第 {attempt} 次：完成（本轮 {count}/{count}）"
     if state == "6":
         return f"第 {attempt} 次：失败"
 
@@ -479,19 +447,29 @@ class AutoStreamRecorder:
         self.incomplete_count = 0
         self.bad_datagrams = 0
 
-        output_dir.mkdir(parents=True, exist_ok=True)
-        self.summary_file: TextIO = (output_dir / "summary.csv").open(
-            "w", newline="", encoding="utf-8"
-        )
-        self.integrity_file: TextIO = (output_dir / "integrity.csv").open(
-            "w", newline="", encoding="utf-8"
-        )
-        self.wave_path = output_dir / "wave_interleaved_a_b_u16le.bin"
-        self.wave_file = self.wave_path.open("wb")
-        self.summary_writer = csv.writer(self.summary_file)
-        self.integrity_writer = csv.writer(self.integrity_file)
-        self.summary_writer.writerow(SUMMARY_OUTPUT_COLUMNS)
-        self.integrity_writer.writerow(STREAM_INTEGRITY_COLUMNS)
+        self.session: Optional[RecordingSession] = None
+        self.recording_ids: set[int] = set()
+        self.record_accepting = False
+        self.on_frame: Callable[..., dict] = lambda assembly: {}
+        self.finalized_order: Deque[int] = deque()
+
+    def start_recording(self, path: Path, metadata: dict) -> None:
+        if self.session is not None:
+            raise ValueError("记录仍在运行或收尾")
+        self.session = RecordingSession(path, metadata, STREAM_INTEGRITY_COLUMNS)
+        self.record_accepting = True
+        self.emit("recording_started", output_dir=path, session_kind=metadata["kind"])
+
+    def stop_recording(self) -> None:
+        self.record_accepting = False
+        self._finish_recording()
+
+    def _finish_recording(self) -> None:
+        if self.session is not None and not self.record_accepting and not self.recording_ids:
+            path = self.session.path
+            self.session.close()
+            self.session = None
+            self.emit("recording_done", output_dir=path)
 
     def _assembly(self, frame_id: int, now: float) -> Optional[AutoFrameAssembly]:
         if frame_id in self.finalized_ids:
@@ -505,6 +483,8 @@ class AutoStreamRecorder:
                 last_seen_monotonic=now,
             )
             self.frames[frame_id] = assembly
+            if self.record_accepting:
+                self.recording_ids.add(frame_id)
         else:
             assembly.last_seen_monotonic = now
         return assembly
@@ -593,49 +573,24 @@ class AutoStreamRecorder:
         frame.end_time = time.time()
         complete = assembly.complete()
         missing = frame.missing_wave_chunks()
-        wave_saved = complete and frame.wave_bytes is not None
-        wave_byte_offset: Optional[int] = None
-        wave_byte_count = 0
+        torque = self.on_frame(assembly)
+        wave_saved = False
+        if self.session is not None and frame_id in self.recording_ids:
+            try:
+                self.session.save(assembly, reason, self.bad_datagrams, torque)
+            except Exception:
+                self.session.close()
+                self.session = None
+                self.record_accepting = False
+                self.recording_ids.clear()
+                raise
+            self.recording_ids.discard(frame_id)
+            wave_saved = complete and frame.wave_bytes is not None
+        self._finish_recording()
 
-        if frame.summary_received:
-            self.summary_writer.writerow(
-                [frame.summary.get(name, "") for name in SUMMARY_COLUMNS]
-                + [format_pc_timestamp(frame.summary_received_time)]
-            )
-            self.summary_file.flush()
-        if wave_saved:
-            wave_byte_offset, wave_byte_count = self._append_wave_binary(
-                frame.wave_bytes or bytearray()
-            )
-
-        self.integrity_writer.writerow(
-            [
-                frame_id,
-                int(complete),
-                int(wave_saved),
-                self.wave_path.name if wave_saved else "",
-                wave_byte_offset if wave_byte_offset is not None else "",
-                wave_byte_count if wave_saved else "",
-                reason,
-                int(frame.summary_received),
-                len(frame.wave_received),
-                frame.wave_total_chunks if frame.wave_total_chunks is not None else "",
-                assembly.received_samples,
-                frame.wave_total_samples if frame.wave_total_samples is not None else "",
-                len(missing) if frame.wave_total_chunks is not None else "",
-                ";".join(str(index) for index in missing),
-                frame.stats.wave_duplicates,
-                frame.stats.wave_bad_packets,
-                self.bad_datagrams,
-                f"{frame.end_time - frame.start_time:.6f}",
-                format_pc_timestamp(
-                    frame.summary_received_time
-                    if frame.summary_received_time is not None
-                    else frame.end_time
-                ),
-            ]
-        )
-        self.integrity_file.flush()
+        self.finalized_order.append(frame_id)
+        if len(self.finalized_order) > 8192:
+            self.finalized_ids.discard(self.finalized_order.popleft())
 
         self.finalized_ids.add(frame_id)
         self.finalized_count += 1
@@ -648,6 +603,7 @@ class AutoStreamRecorder:
             frame_id=frame_id,
             summary=frame.summary,
             complete=complete,
+            wave_saved=wave_saved,
             reason=reason,
             received_chunks=len(frame.wave_received),
             total_chunks=frame.wave_total_chunks,
@@ -660,17 +616,16 @@ class AutoStreamRecorder:
             bad_datagrams=self.bad_datagrams,
         )
 
-    def _append_wave_binary(self, wave_bytes: bytearray) -> Tuple[int, int]:
-        offset = self.wave_file.tell()
-        self.wave_file.write(wave_bytes)
-        self.wave_file.flush()
-        return offset, len(wave_bytes)
-
     def close(self, reason: str = "stream_stopped") -> None:
-        for frame_id in list(self.frames):
-            self._finalize(frame_id, reason)
-        for handle in (self.summary_file, self.integrity_file, self.wave_file):
-            handle.close()
+        self.record_accepting = False
+        try:
+            for frame_id in list(self.frames):
+                self._finalize(frame_id, reason)
+            self._finish_recording()
+        finally:
+            if self.session is not None:
+                self.session.close()
+                self.session = None
 
 
 class UdpWorker:
@@ -806,8 +761,10 @@ class UdpWorker:
             self.emit("log", message=f"#HOST,calibration_start,dir={output_dir}")
             self.drain_text(sock, 0.1)
             status_values = self._request_calibration_status(
-                sock, "CAL_START", timeout_s=2.0
+                sock, "CAL_START_SHORT", timeout_s=2.0
             )
+            if status_values.get("points") != "3125" or status_values.get("cal_protocol") != "2":
+                raise RuntimeError("板端不支持 3125 点短帧校准，请先更新 PS 固件")
 
             while status_values.get("state") not in ("5", "6"):
                 state = status_values.get("state", "")
@@ -842,6 +799,8 @@ class UdpWorker:
                 )
                 if result.command_error is not None:
                     raise RuntimeError(result.command_error)
+                if frame.wave_total_samples != 3125:
+                    raise RuntimeError("校准回传帧不是 3125 点，请检查板端短帧固件")
 
                 # The firmware only pushes progress at stage transitions.
                 # Query after every frame so the GUI stays board-authoritative.
@@ -873,127 +832,6 @@ class UdpWorker:
             if sock is not None:
                 sock.close()
 
-    def run_auto_stream(
-        self,
-        record_stop_event: threading.Event,
-        monitor_stop_event: threading.Event,
-        out_dir: Path,
-        startup_command: str,
-    ) -> None:
-        """Start L2 monitoring, then receive and persist frames until stopped."""
-        sock: Optional[socket.socket] = None
-        recorder: Optional[AutoStreamRecorder] = None
-        failure: Optional[Exception] = None
-        startup_pending = True
-        startup_deadline = time.monotonic() + 2.0
-        startup_command_sent = False
-        startup_rejected = False
-        monitoring_started = False
-        monitoring_stopped = False
-
-        def mark_monitoring_started() -> None:
-            nonlocal monitoring_started, startup_pending
-            startup_pending = False
-            if not monitoring_started:
-                monitoring_started = True
-                self.emit("monitor_started")
-
-        try:
-            sock = self.open_socket()
-            recorder = AutoStreamRecorder(out_dir, self.emit, self.summary_grace_s)
-            self.emit("log", message=f"#HOST,auto_stream_start,dir={out_dir}")
-            self.send_command(sock, startup_command)
-            startup_command_sent = True
-
-            while not record_stop_event.is_set() and not monitor_stop_event.is_set():
-                try:
-                    data, _addr = sock.recvfrom(65535)
-                except socket.timeout:
-                    recorder.sweep()
-                    if (
-                        startup_pending and time.monotonic() >= startup_deadline
-                    ):
-                        raise RuntimeError("开始L2监测超时：未收到板端回复")
-                    continue
-                except OSError:
-                    if record_stop_event.is_set() or monitor_stop_event.is_set():
-                        break
-                    raise
-
-                if data.startswith(WV32_MAGIC):
-                    mark_monitoring_started()
-                    recorder.accept_wave(data)
-                elif data.startswith(LS32_MAGIC):
-                    continue  # L2-triggered short frames do not send LS32
-                else:
-                    text = parse_text_datagram(data)
-                    if text is None:
-                        continue
-                    for line in text.splitlines():
-                        clean = line.strip()
-                        if not clean or clean.startswith("#CAPTURE"):
-                            continue  # suppress per-frame trigger spam
-                        if recorder.accept_summary(clean):
-                            mark_monitoring_started()
-                            continue
-                        self.emit("log", message=clean)
-                        if startup_pending:
-                            if clean.startswith(("#ERR", "#BUSY")):
-                                if clean.startswith("#ERR,auto_already_active"):
-                                    mark_monitoring_started()
-                                else:
-                                    startup_rejected = True
-                                raise RuntimeError(f"开始L2监测失败：{clean}")
-                            if clean.startswith("#AUTO,STARTED"):
-                                mark_monitoring_started()
-                recorder.sweep()
-
-        except Exception as exc:
-            failure = exc
-        finally:
-            if monitor_stop_event.is_set() and sock is not None:
-                try:
-                    monitoring_stopped = self._stop_monitoring_on_socket(
-                        sock, recorder
-                    )
-                except Exception as exc:
-                    if failure is None:
-                        failure = exc
-            if recorder is not None:
-                try:
-                    recorder.close("stream_stopped" if failure is None else "stream_error")
-                except Exception as exc:
-                    if failure is None:
-                        failure = exc
-            if sock is not None:
-                sock.close()
-            # If AUTO_START was sent but all acknowledgements were lost, the
-            # board state is unknown. Keep controls locked and offer
-            # "Stop monitoring" instead of incorrectly assuming it is idle.
-            monitoring_active = (
-                monitoring_started
-                or (startup_command_sent and not startup_rejected)
-            ) and not monitoring_stopped
-            if failure is not None:
-                self.emit(
-                    "error",
-                    title="L2监测记录失败",
-                    message=str(failure),
-                    operation="stream",
-                    monitoring_active=monitoring_active,
-                    output_dir=out_dir,
-                )
-            else:
-                self.emit(
-                    "stream_done",
-                    frames=recorder.finalized_count if recorder is not None else 0,
-                    complete_frames=recorder.complete_count if recorder is not None else 0,
-                    incomplete_frames=recorder.incomplete_count if recorder is not None else 0,
-                    bad_datagrams=recorder.bad_datagrams if recorder is not None else 0,
-                    output_dir=out_dir,
-                    monitoring_active=monitoring_active,
-                    monitoring_stopped=monitoring_stopped,
-                )
 
     def run_stop_monitoring(self) -> None:
         sock: Optional[socket.socket] = None
@@ -1021,6 +859,7 @@ class UdpWorker:
     ) -> Dict[str, str]:
         expected_event = {
             "CAL_START": "STARTED",
+            "CAL_START_SHORT": "STARTED",
             "CAL_STATUS": "STATUS",
         }.get(command)
         self.send_command(sock, command)
@@ -1187,8 +1026,7 @@ class UdpWorker:
             "OK"
             if command_error is None
             and frame.summary_received
-            and wave_missing == 0
-            and sensor_missing == 0
+            and frame.all_expected_chunks_received()
             else "CHECK"
         )
         message = command_error or (
@@ -1210,18 +1048,22 @@ class DSHostGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("DS System UDP 上位机")
-        self.geometry("1280x820")
-        self.minsize(1080, 680)
+        self.geometry("1440x900")
+        self.minsize(1280, 760)
 
         self.events: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self.busy = False
         self.closing = False
         self.streaming = False
+        self.recording = False
+        self.record_pending = False
+        self.model_calibrating = False
+        self.torque_model: Optional[TorqueModel] = None
+        self.monitor_commands: queue.Queue = queue.Queue()
         self.monitoring = False
         self.monitor_starting = False
         self.record_stop_requested = False
         self.monitor_stop_requested = False
-        self.stream_record_stop_event: Optional[threading.Event] = None
         self.stream_monitor_stop_event: Optional[threading.Event] = None
         self.monitor_worker: Optional[UdpWorker] = None
         self.stream_started_monotonic: Optional[float] = None
@@ -1235,7 +1077,10 @@ class DSHostGui(tk.Tk):
         self.wave_min = 0.0
         self.wave_max = 0.0
 
-        self.torque_estimator = MovingTorqueEstimator()
+        self.t0_var = tk.StringVar(value="100")
+        self.model_duration_var = tk.StringVar(value="60")
+        self.average_var = tk.StringVar(value="15")
+        self.model_status_var = tk.StringVar(value="未标定模型；T0 为加载设备设定值，非独立实测")
         self.torque_history: Deque[Tuple[float, float]] = deque(
             maxlen=TORQUE_HISTORY_MAX_POINTS
         )
@@ -1312,6 +1157,7 @@ class DSHostGui(tk.Tk):
 
         self.buttons: List[ttk.Button] = []
         self.l2_parameter_entries: List[ttk.Entry] = []
+        self.connection_entries: List[ttk.Entry] = []
         self._build_style()
         self._build_ui()
         self._refresh_control_states()
@@ -1344,19 +1190,27 @@ class DSHostGui(tk.Tk):
         bar.columnconfigure(9, weight=1)
 
         ttk.Label(bar, text="板端 IP").grid(row=0, column=0, sticky="w", padx=(0, 4))
-        ttk.Entry(bar, textvariable=self.board_ip_var, width=15).grid(
+        entry = ttk.Entry(bar, textvariable=self.board_ip_var, width=13)
+        self.connection_entries.append(entry)
+        entry.grid(
             row=0, column=1, sticky="w", padx=(0, 10)
         )
         ttk.Label(bar, text="板端端口").grid(row=0, column=2, sticky="w", padx=(0, 4))
-        ttk.Entry(bar, textvariable=self.board_port_var, width=7).grid(
+        entry = ttk.Entry(bar, textvariable=self.board_port_var, width=6)
+        self.connection_entries.append(entry)
+        entry.grid(
             row=0, column=3, sticky="w", padx=(0, 10)
         )
         ttk.Label(bar, text="本地绑定").grid(row=0, column=4, sticky="w", padx=(0, 4))
-        ttk.Entry(bar, textvariable=self.bind_ip_var, width=13).grid(
+        entry = ttk.Entry(bar, textvariable=self.bind_ip_var, width=11)
+        self.connection_entries.append(entry)
+        entry.grid(
             row=0, column=5, sticky="w", padx=(0, 10)
         )
         ttk.Label(bar, text="PC 端口").grid(row=0, column=6, sticky="w", padx=(0, 4))
-        ttk.Entry(bar, textvariable=self.pc_port_var, width=7).grid(
+        entry = ttk.Entry(bar, textvariable=self.pc_port_var, width=6)
+        self.connection_entries.append(entry)
+        entry.grid(
             row=0, column=7, sticky="w", padx=(0, 10)
         )
 
@@ -1383,7 +1237,7 @@ class DSHostGui(tk.Tk):
         ).pack(side=tk.LEFT)
 
         state_label = ttk.Label(bar, textvariable=self.worker_state_var, style="Status.TLabel")
-        state_label.grid(row=0, column=12, sticky="e")
+        state_label.grid(row=5, column=0, columnspan=13, sticky="w")
 
         row2 = ttk.Frame(bar)
         row2.grid(row=1, column=0, columnspan=13, sticky="ew", pady=(8, 0))
@@ -1400,7 +1254,7 @@ class DSHostGui(tk.Tk):
 
         calibration_btn = ttk.Button(
             row2,
-            text="开始校准",
+            text="① 开始通道校准",
             command=self._start_calibration,
         )
         calibration_btn.pack(side=tk.LEFT, padx=(0, 6))
@@ -1435,9 +1289,9 @@ class DSHostGui(tk.Tk):
         ttk.Button(row2, text="清空日志", command=self._clear_log).pack(side=tk.RIGHT)
 
         row3 = ttk.Frame(bar)
-        row3.grid(row=2, column=0, columnspan=13, sticky="ew", pady=(6, 0))
+        row3.grid(row=3, column=0, columnspan=13, sticky="ew", pady=(6, 0))
 
-        ttk.Label(row3, text="L2触发采集", style="Title.TLabel").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(row3, text="③ L2监测 / 记录", style="Title.TLabel").pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(row3, text="转速 rpm").pack(side=tk.LEFT, padx=(0, 4))
         rpm_entry = ttk.Entry(row3, textvariable=self.auto_rpm_var, width=7)
         rpm_entry.pack(side=tk.LEFT, padx=(0, 8))
@@ -1453,11 +1307,14 @@ class DSHostGui(tk.Tk):
 
         self.start_monitor_btn = ttk.Button(
             row3,
-            text="开始监测并记录",
+            text="开始监测",
             style="Primary.TButton",
             command=self._start_auto_stream,
         )
         self.start_monitor_btn.pack(side=tk.LEFT, padx=(10, 6))
+
+        self.record_start_btn = ttk.Button(row3, text="开始记录", command=self._start_recording)
+        self.record_start_btn.pack(side=tk.LEFT, padx=(0, 6))
 
         self.stream_stop_btn = ttk.Button(
             row3, text="停止记录", command=self._stop_auto_stream, state=tk.DISABLED
@@ -1471,6 +1328,26 @@ class DSHostGui(tk.Tk):
             state=tk.DISABLED,
         )
         self.monitor_stop_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        row4 = ttk.Frame(bar)
+        row4.grid(row=2, column=0, columnspan=13, sticky="ew", pady=(6, 0))
+        ttk.Label(row4, text="② 扭矩模型标定", style="Title.TLabel").pack(side=tk.LEFT, padx=(0, 8))
+        self.model_entries = []
+        for label, var, width in (("T0设定值 N·m", self.t0_var, 8), ("标定时间 s", self.model_duration_var, 6)):
+            ttk.Label(row4, text=label).pack(side=tk.LEFT, padx=(0, 4))
+            entry = ttk.Entry(row4, textvariable=var, width=width)
+            entry.pack(side=tk.LEFT, padx=(0, 8))
+            self.model_entries.append(entry)
+        ttk.Label(row4, text="平均帧数").pack(side=tk.LEFT, padx=(0, 4))
+        entry = ttk.Entry(row4, textvariable=self.average_var, width=5)
+        entry.pack(side=tk.LEFT, padx=(0, 8))
+        self.l2_parameter_entries.append(entry)
+        self.model_start_btn = ttk.Button(row4, text="开始标定", command=self._start_model_calibration)
+        self.model_start_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.model_cancel_btn = ttk.Button(row4, text="取消标定", command=self._cancel_model_calibration)
+        self.model_cancel_btn.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(bar, textvariable=self.model_status_var, wraplength=1250).grid(
+            row=4, column=0, columnspan=13, sticky="w", pady=(4, 0))
 
     def _build_main_area(self) -> None:
         main = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
@@ -1737,7 +1614,7 @@ class DSHostGui(tk.Tk):
         )
         ttk.Label(
             header,
-            text="最近 60 秒；me_2x_uV 经 15 个L2触发帧滑动平均后换算",
+            text="最近 60 秒；me_2x_uV 按主界面平均帧数滤波，再用本次标定模型换算",
             foreground="#6b7280",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
@@ -1764,46 +1641,19 @@ class DSHostGui(tk.Tk):
             window.destroy()
 
     def _reset_torque(self) -> None:
-        self.torque_estimator.reset()
         self.torque_history.clear()
         self.torque_var.set("-- N·m（等待数据）")
         self._schedule_torque_curve_redraw()
 
-    def _ingest_torque_summary(
-        self,
-        summary: Dict[str, str],
-        sample_monotonic_s: Optional[float] = None,
-    ) -> None:
-        raw_value = str(summary.get("me_2x_uV", "") or "").strip()
-        if not raw_value:
+    def _ingest_torque_sample(self, row: dict) -> None:
+        value = row.get("torque_nm")
+        if row.get("quality") != "valid":
+            labels = {"no_model": "未标定模型", "warming_up": "平均窗口预热",
+                      "window_exceeds_5s": "平均窗口超过5秒", "incomplete_frame": "帧不完整"}
+            self.torque_var.set("-- N·m（" + labels.get(row.get("quality"), "数据无效") + "）")
             return
-        try:
-            me_2x_uV = float(raw_value)
-            torque_nm = self.torque_estimator.add(me_2x_uV)
-        except (TypeError, ValueError):
-            return
-
-        if not self.torque_estimator.ready:
-            self.torque_var.set(
-                "-- N·m（预热 "
-                f"{self.torque_estimator.count}/{self.torque_estimator.window_size}）"
-            )
-            self._schedule_torque_curve_redraw()
-            return
-
-        timestamp = time.monotonic()
-        if sample_monotonic_s is not None:
-            try:
-                candidate = float(sample_monotonic_s)
-                if math.isfinite(candidate):
-                    timestamp = candidate
-            except (TypeError, ValueError):
-                pass
-        if self.torque_history and timestamp <= self.torque_history[-1][0]:
-            timestamp = self.torque_history[-1][0] + 1e-6
-
-        self.torque_history.append((timestamp, torque_nm))
-        self.torque_var.set(f"{torque_nm:,.1f} N·m")
+        self.torque_history.append((float(row["sample_monotonic_s"]), float(value)))
+        self.torque_var.set(f"{value:,.1f} N·m")
         self._schedule_torque_curve_redraw()
 
     def _schedule_torque_curve_redraw(self) -> None:
@@ -1854,19 +1704,13 @@ class DSHostGui(tk.Tk):
         canvas.create_text(
             (left + right) / 2,
             height - 14,
-            text="时间（相对当前，s）",
+            text="时间（相对最新有效帧，s）",
             fill="#4b5563",
             font=("Microsoft YaHei UI", 9),
         )
 
         if not self.torque_history:
-            if self.torque_estimator.count:
-                message = (
-                    "正在累计 15 帧滤波窗口："
-                    f"{self.torque_estimator.count}/{self.torque_estimator.window_size}"
-                )
-            else:
-                message = "等待L2触发采集的 summary 数据"
+            message = "等待有效扭矩数据：请先标定模型并完成平均窗口预热"
             canvas.create_text(
                 (left + right) / 2,
                 (top + bottom) / 2,
@@ -1959,7 +1803,7 @@ class DSHostGui(tk.Tk):
             anchor=tk.E,
             text=(
                 f"当前 {points[-1][1]:,.1f}   "
-                f"最小 {data_min:,.1f}   最大 {data_max:,.1f} N·m"
+                f"最小 {data_min:,.1f}   最大 {data_max:,.1f}   峰峰值 {data_max-data_min:,.1f} N·m"
             ),
             fill="#374151",
             font=("Microsoft YaHei UI", 9),
@@ -2053,8 +1897,17 @@ class DSHostGui(tk.Tk):
             if self.monitoring or self.monitor_starting or self.streaming
             else tk.NORMAL
         )
-        for entry in self.l2_parameter_entries:
+        for entry in self.l2_parameter_entries + self.connection_entries:
             entry.configure(state=parameter_state)
+
+        can_model = (not general_locked or (self.streaming and self.monitoring)) and not (
+            self.recording or self.record_pending or self.model_calibrating or self.monitor_stop_requested)
+        self.model_start_btn.configure(state=tk.NORMAL if can_model else tk.DISABLED)
+        self.model_cancel_btn.configure(state=tk.NORMAL if self.model_calibrating else tk.DISABLED)
+        for entry in self.model_entries:
+            entry.configure(state=tk.DISABLED if self.model_calibrating else tk.NORMAL)
+        self.record_start_btn.configure(state=tk.NORMAL if self.streaming and self.monitoring and not (
+            self.recording or self.record_pending or self.model_calibrating or self.monitor_stop_requested) else tk.DISABLED)
 
         can_start = not general_locked
         self.start_monitor_btn.configure(
@@ -2065,6 +1918,8 @@ class DSHostGui(tk.Tk):
                 tk.NORMAL
                 if self.streaming
                 and self.monitoring
+                and self.recording
+                and not self.model_calibrating
                 and not self.record_stop_requested
                 and not self.monitor_stop_requested
                 else tk.DISABLED
@@ -2096,6 +1951,8 @@ class DSHostGui(tk.Tk):
         worker = self._make_worker()
         if worker is None:
             return
+        if command.split(",")[0] in ("CAL_START", "CAL_START_SHORT", "CAL_CLEAR", "CAL_ABORT"):
+            self._invalidate_model("通道校准已改变，需要重新标定模型")
         self._start_thread(
             lambda: worker.run_command(command, wait_s, stop_on_first_reply),
             f"执行 {command}",
@@ -2120,6 +1977,7 @@ class DSHostGui(tk.Tk):
         if worker is None:
             return
         self._reset_capture_views("校准事务")
+        self._invalidate_model("正在通道校准，完成后请进行扭矩模型标定")
         self.cal_vars["progress"].set("准备中")
         self._start_thread(worker.run_calibration, "正在执行完整校准事务…")
 
@@ -2134,57 +1992,93 @@ class DSHostGui(tk.Tk):
             messagebox.showerror("参数错误", f"L2触发参数无效: {exc}")
             return None
 
-    def _start_auto_stream(self) -> None:
+    def _start_auto_stream(self, training: Optional[dict] = None) -> None:
         if self.busy or self.streaming or self.monitoring or self.monitor_starting:
             return
         config = self._read_auto_config()
         if config is None:
             return
+        try:
+            _, _, window = validate_settings(self.t0_var.get(), self.model_duration_var.get(), self.average_var.get())
+        except ValueError as exc:
+            messagebox.showerror("参数错误", str(exc))
+            return
         worker = self._make_worker()
         if worker is None:
             return
-        try:
-            out_dir = unique_output_dir(
-                Path(self.output_root_var.get()).expanduser(),
-                "auto_log",
-            )
-        except Exception as exc:
-            messagebox.showerror("输出目录错误", str(exc))
-            return
-
-        self._reset_capture_views("L2触发连续")
-        self.info_vars["out_dir"].set(str(out_dir))
+        config_dict = asdict(config)
+        config_dict.update(board_ip=worker.board_addr[0], board_port=worker.board_addr[1])
+        if self.torque_model is not None and config_dict != self.torque_model.trigger:
+            self._invalidate_model("触发参数或采集点数已改变，请重新标定模型")
+        self._reset_capture_views("L2触发监测")
+        self.info_vars["out_dir"].set("未记录")
         self.info_vars["sensor_chunks"].set("L2触发模式不回传")
         self.info_vars["sensor_records"].set("L2触发模式不回传")
         self.stream_started_monotonic = time.monotonic()
-        record_stop_event = threading.Event()
-        monitor_stop_event = threading.Event()
-        self.stream_record_stop_event = record_stop_event
-        self.stream_monitor_stop_event = monitor_stop_event
+        self.stream_monitor_stop_event = threading.Event()
+        self.monitor_commands = queue.Queue()
         self.monitor_worker = worker
-        self.streaming = True
-        self.monitor_starting = True
+        self.streaming = self.monitor_starting = True
         self.monitoring = False
-        self.record_stop_requested = False
-        self.monitor_stop_requested = False
-        self._set_busy(True, "正在开始L2监测并记录…")
+        self.record_stop_requested = self.monitor_stop_requested = False
+        self._set_busy(True, "正在开始L2监测…")
         thread = threading.Thread(
-            target=lambda: worker.run_auto_stream(
-                record_stop_event,
-                monitor_stop_event,
-                out_dir,
-                startup_command=config.command("AUTO_START"),
-            ),
+            target=run_monitor,
+            args=(worker, AutoStreamRecorder, self.stream_monitor_stop_event,
+                  self.monitor_commands, config_dict, self.torque_model, window, training),
             daemon=True,
         )
         thread.start()
 
+    def _start_recording(self) -> None:
+        if not self.streaming or not self.monitoring or self.recording or self.record_pending:
+            return
+        try:
+            path = unique_output_dir(Path(self.output_root_var.get()).expanduser(), "auto_log")
+        except Exception as exc:
+            messagebox.showerror("输出目录错误", str(exc))
+            return
+        self.record_pending = True
+        self.monitor_commands.put({"kind": "record_start", "path": path})
+        self._refresh_control_states()
+
     def _stop_auto_stream(self) -> None:
-        if self.streaming and self.stream_record_stop_event is not None:
+        if self.streaming and self.recording and not self.model_calibrating:
             self.record_stop_requested = True
-            self.stream_record_stop_event.set()
-            self.worker_state_var.set("正在停止记录…")
+            self.monitor_commands.put({"kind": "record_stop"})
+            self.worker_state_var.set("正在结束本次记录，监测继续…")
             self._refresh_control_states()
+
+    def _invalidate_model(self, reason: str) -> None:
+        self.torque_model = None
+        self.model_status_var.set(reason)
+        self._reset_torque()
+
+    def _start_model_calibration(self) -> None:
+        if self.recording or self.record_pending or self.model_calibrating:
+            return
+        try:
+            t0, duration, _ = validate_settings(self.t0_var.get(), self.model_duration_var.get(), self.average_var.get())
+            path = unique_output_dir(Path(self.output_root_var.get()).expanduser(), "model_cal")
+        except ValueError as exc:
+            messagebox.showerror("标定参数错误", str(exc))
+            return
+        action = dict(kind="model_start", t0=t0, duration=duration, path=path)
+        if self.streaming and self.monitoring:
+            self.monitor_commands.put(action)
+        elif not self.busy:
+            self._start_auto_stream(action)
+            if not self.streaming:
+                return
+        else:
+            return
+        self.model_calibrating = True
+        self.model_status_var.set("准备标定：等待首个有效 L2 触发帧（最多20秒）")
+        self._refresh_control_states()
+
+    def _cancel_model_calibration(self) -> None:
+        if self.streaming:
+            self.monitor_commands.put({"kind": "model_cancel"})
 
     def _stop_l2_monitoring(self) -> None:
         if self.monitor_stop_requested:
@@ -2246,6 +2140,58 @@ class DSHostGui(tk.Tk):
             self._ingest_status_line(message)
         elif kind == "progress":
             self._update_progress(event["snapshot"])
+        elif kind == "torque_sample":
+            self._ingest_torque_sample(event["row"])
+        elif kind == "torque_stale":
+            self.torque_var.set("-- N·m（超过5秒无有效更新）")
+        elif kind == "model_invalidated":
+            self._invalidate_model("模型失效：" + event["message"])
+        elif kind == "recording_started":
+            self.recording, self.record_pending = True, False
+            self.record_stop_requested = False
+            self.info_vars["out_dir"].set(str(event["output_dir"]))
+            self._append_log(f"#HOST,recording_started,dir={event['output_dir']}")
+            self._refresh_control_states()
+        elif kind == "recording_done":
+            self.recording = self.record_pending = self.record_stop_requested = False
+            self._append_log(f"#HOST,recording_done,dir={event['output_dir']}")
+            self.worker_state_var.set("L2监测中（未记录）")
+            self._refresh_control_states()
+        elif kind == "model_started":
+            self.model_calibrating = True
+            self._refresh_control_states()
+        elif kind == "model_progress":
+            self.model_status_var.set(
+                f"模型标定 {event['elapsed']:.1f}/{event['duration']:.1f} s，"
+                f"有效 {event['count']} 帧，剔除 {event['rejected']} 帧；请保持负载和转速稳定")
+        elif kind == "model_finished":
+            self.model_calibrating = False
+            if event.get("success"):
+                self.torque_model = event["model"]
+                model = self.torque_model
+                stats = model.statistics
+                peak_to_peak = stats['filtered_peak_to_peak_nm']
+                pp_text = f"{peak_to_peak:.1f}" if peak_to_peak is not None else "不可评估"
+                self._reset_torque()
+                self.model_status_var.set(
+                    f"模型已应用：T=0.4424×(ME−{model.v0_uv:.3f})+{model.t0_nm:g}；"
+                    f"标定区间滤波峰峰值 {pp_text} N·m，"
+                    f"估计窗口 {stats['estimated_window_s']:.2f}s；"
+                    f"{'区间稳定性检查通过' if stats['stability_check_passed'] else '区间稳定性未达标'}（非绝对精度验收）")
+                self._append_log(f"#HOST,model_saved,path={event['path'] / 'model.json'}")
+            else:
+                self.model_status_var.set("模型标定未完成：" + event.get("message", ""))
+                self._append_log(self.model_status_var.get())
+            self._refresh_control_states()
+        elif kind == "action_error":
+            if event.get("action") == "record_start":
+                self.record_pending = False
+            if event.get("action") == "model_start":
+                self.model_calibrating = False
+            self._append_log("#HOST,action_error," + event["message"])
+            self._refresh_control_states()
+            if not self.closing:
+                messagebox.showerror("操作未完成", event["message"])
         elif kind == "command_done":
             lines: Sequence[str] = event.get("lines", ())
             if not lines:
@@ -2302,7 +2248,7 @@ class DSHostGui(tk.Tk):
         elif kind == "monitor_started":
             self.monitor_starting = False
             self.monitoring = True
-            self.worker_state_var.set("L2监测并记录中")
+            self.worker_state_var.set("L2监测中（未记录）")
             self._refresh_control_states()
         elif kind == "stream_wave":
             self._ingest_stream_wave(event)
@@ -2310,10 +2256,6 @@ class DSHostGui(tk.Tk):
             summary = event.get("summary", {})
             self._populate_summary(summary)
             self._refresh_summary_labels(summary)
-            self._ingest_torque_summary(
-                summary,
-                event.get("sample_monotonic_s"),
-            )
             self.info_vars["frame_id"].set(str(event.get("frame_id", "-")))
             self.info_vars["summary"].set("已收到")
         elif kind == "stream_frame_done":
@@ -2324,7 +2266,7 @@ class DSHostGui(tk.Tk):
             self.info_vars["frame_id"].set(str(frame_id))
             if self.stream_started_monotonic is not None:
                 self.info_vars["elapsed"].set(
-                    f"{time.monotonic() - self.stream_started_monotonic:.2f} s（本次记录）"
+                    f"{time.monotonic() - self.stream_started_monotonic:.2f} s（本次监测）"
                 )
             self.info_vars["summary"].set("已收到" if summary else "未收到")
             self.info_vars["wave_chunks"].set(
@@ -2335,7 +2277,7 @@ class DSHostGui(tk.Tk):
             )
             self.info_vars["missing"].set(
                 f"WV32 {missing if missing is not None else '?'}；"
-                f"{'完整，已追加到会话波形文件' if complete else '不完整，未写入波形文件'}"
+                f"{'完整，已保存' if event.get('wave_saved') else ('完整，未记录' if complete else '不完整，未写入波形文件')}"
             )
             complete_frames = event.get("complete_frames", 0)
             incomplete_frames = event.get("incomplete_frames", 0)
@@ -2344,7 +2286,7 @@ class DSHostGui(tk.Tk):
                 f"BAD {event.get('bad_datagrams', 0)}"
             )
             self.worker_state_var.set(
-                f"L2记录：完整 {complete_frames}，不完整 {incomplete_frames}"
+                f"L2{'记录' if self.recording else '监测'}：完整 {complete_frames}，不完整 {incomplete_frames}"
             )
             if not complete:
                 self._append_log(
@@ -2353,9 +2295,10 @@ class DSHostGui(tk.Tk):
                 )
         elif kind == "stream_done":
             self.streaming = False
+            self.recording = self.record_pending = self.model_calibrating = False
+            self.torque_var.set("-- N·m（监测已停止）")
             self.monitor_starting = False
             self.monitoring = bool(event.get("monitoring_active"))
-            self.stream_record_stop_event = None
             self.stream_monitor_stop_event = None
             self.stream_started_monotonic = None
             self.record_stop_requested = False
@@ -2380,9 +2323,10 @@ class DSHostGui(tk.Tk):
         elif kind == "error":
             self._append_log(f"#HOST,error,{event.get('message', '')}")
             operation = str(event.get("operation", ""))
-            if operation == "stream" or self.streaming:
+            if operation == "stream":
                 self.streaming = False
-                self.stream_record_stop_event = None
+                self.recording = self.record_pending = self.model_calibrating = False
+                self.torque_var.set("-- N·m（监测异常）")
                 self.stream_monitor_stop_event = None
                 self.stream_started_monotonic = None
                 self.record_stop_requested = False
@@ -2454,7 +2398,7 @@ class DSHostGui(tk.Tk):
         self._populate_summary(frame.summary)
         self._populate_sensor_table(frame)
         self._refresh_summary_labels(frame.summary)
-        self._ingest_torque_summary(frame.summary)
+        self.torque_var.set("-- N·m（手动帧仅预览）")
         self._refresh_wave_preview()
 
     def _populate_summary(self, summary: Dict[str, str]) -> None:
@@ -2489,10 +2433,10 @@ class DSHostGui(tk.Tk):
         if tag != "CAL":
             return
 
-        if values.get("event") == "CLEARED":
+        if values.get("event") in ("CLEARED", "STARTED", "ABORTED", "BOOT"):
             for var in self.cal_vars.values():
                 var.set("-")
-            self._reset_torque()
+            self._invalidate_model("通道校准状态改变，请重新标定模型")
 
         state = values.get("state", "")
         state_name = values.get("state_name") or CAL_STATE_NAMES.get(state, "UNKNOWN")
@@ -2553,7 +2497,7 @@ class DSHostGui(tk.Tk):
         self.info_vars["frame_id"].set(str(fid))
         if self.stream_started_monotonic is not None:
             self.info_vars["elapsed"].set(
-                f"{time.monotonic() - self.stream_started_monotonic:.2f} s（本次记录）"
+                f"{time.monotonic() - self.stream_started_monotonic:.2f} s（本次监测）"
             )
         self.info_vars["wave_chunks"].set(fmt_count(received_chunks, total_chunks))
         self.info_vars["wave_samples"].set(fmt_count(received_samples, total))

@@ -187,29 +187,29 @@
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
         </FileInfo>
-        <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_hp_smartconnect_0_0/ps_system_hp_smartconnect_0_0.xci">
-          <Proxy FileSetName="ps_system_hp_smartconnect_0_0"/>
-        </CompFileExtendedInfo>
-        <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_axi_dma_0_0/ps_system_axi_dma_0_0.xci">
-          <Proxy FileSetName="ps_system_axi_dma_0_0"/>
+        <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_m1_axis_bridge_0_1/ps_system_m1_axis_bridge_0_1.xci">
+          <Proxy FileSetName="ps_system_m1_axis_bridge_0_1"/>
         </CompFileExtendedInfo>
         <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_processing_system7_0_0/ps_system_processing_system7_0_0.xci">
           <Proxy FileSetName="ps_system_processing_system7_0_0"/>
         </CompFileExtendedInfo>
-        <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_laser_axi_regs_0_0/ps_system_laser_axi_regs_0_0.xci">
-          <Proxy FileSetName="ps_system_laser_axi_regs_0_0"/>
+        <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_system_ila_0_0/ps_system_system_ila_0_0.xci">
+          <Proxy FileSetName="ps_system_system_ila_0_0"/>
+        </CompFileExtendedInfo>
+        <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_axi_dma_0_0/ps_system_axi_dma_0_0.xci">
+          <Proxy FileSetName="ps_system_axi_dma_0_0"/>
         </CompFileExtendedInfo>
         <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_smartconnect_0_0/ps_system_smartconnect_0_0.xci">
           <Proxy FileSetName="ps_system_smartconnect_0_0"/>
         </CompFileExtendedInfo>
-        <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_m1_axis_bridge_0_1/ps_system_m1_axis_bridge_0_1.xci">
-          <Proxy FileSetName="ps_system_m1_axis_bridge_0_1"/>
-        </CompFileExtendedInfo>
-        <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_system_ila_0_0/ps_system_system_ila_0_0.xci">
-          <Proxy FileSetName="ps_system_system_ila_0_0"/>
-        </CompFileExtendedInfo>
         <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_pl_capture_logic_0_0/ps_system_pl_capture_logic_0_0.xci">
           <Proxy FileSetName="ps_system_pl_capture_logic_0_0"/>
+        </CompFileExtendedInfo>
+        <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_hp_smartconnect_0_0/ps_system_hp_smartconnect_0_0.xci">
+          <Proxy FileSetName="ps_system_hp_smartconnect_0_0"/>
+        </CompFileExtendedInfo>
+        <CompFileExtendedInfo CompFileName="ps_system.bd" FileRelPathName="ip/ps_system_laser_axi_regs_0_0/ps_system_laser_axi_regs_0_0.xci">
+          <Proxy FileSetName="ps_system_laser_axi_regs_0_0"/>
         </CompFileExtendedInfo>
       </File>
       <File Path="$PSRCDIR/sources_1/bd/ps_system/hdl/ps_system_wrapper.v">
@@ -234,16 +234,6 @@
           <Attr Name="AutoDisabled" Val="1"/>
           <Attr Name="ImportPath" Val="$PPRDIR/../pl_zynq7020_periodic_db_sources/src/cdc_pulse_sync.v"/>
           <Attr Name="ImportTime" Val="1783649805"/>
-          <Attr Name="UsedIn" Val="synthesis"/>
-          <Attr Name="UsedIn" Val="implementation"/>
-          <Attr Name="UsedIn" Val="simulation"/>
-        </FileInfo>
-      </File>
-      <File Path="$PSRCDIR/sources_1/imports/adc_pp_modified/daq_capture_core.v">
-        <FileInfo>
-          <Attr Name="AutoDisabled" Val="1"/>
-          <Attr Name="ImportPath" Val="$PPRDIR/../../../../../Vivado/project2/gpt/2026-7-10-gpt/gpt_src/2026-7-16-14-41gptsrc/adc_pp_modified_sources/adc_pp_modified/daq_capture_core.v"/>
-          <Attr Name="ImportTime" Val="1784184078"/>
           <Attr Name="UsedIn" Val="synthesis"/>
           <Attr Name="UsedIn" Val="implementation"/>
           <Attr Name="UsedIn" Val="simulation"/>
@@ -449,9 +439,7 @@
     </Run>
     <Run Id="ps_system_pl_capture_logic_0_0_synth_1" Type="Ft3:Synth" SrcSet="ps_system_pl_capture_logic_0_0" Part="xc7z020clg400-2" ConstrsSet="ps_system_pl_capture_logic_0_0" Description="Vivado Synthesis Defaults" AutoIncrementalCheckpoint="false" WriteIncrSynthDcp="false" Dir="$PRUNDIR/ps_system_pl_capture_logic_0_0_synth_1" IncludeInArchive="true">
       <Strategy Version="1" Minor="2">
-        <StratHandle Name="Vivado Synthesis Defaults" Flow="Vivado Synthesis 2018">
-          <Desc>Vivado Synthesis Defaults</Desc>
-        </StratHandle>
+        <StratHandle Name="Vivado Synthesis Defaults" Flow="Vivado Synthesis 2018"/>
         <Step Id="synth_design"/>
       </Strategy>
       <GeneratedRun Dir="$PRUNDIR" File="gen_run.xml"/>
@@ -460,9 +448,7 @@
     </Run>
     <Run Id="ps_system_laser_axi_regs_0_0_synth_1" Type="Ft3:Synth" SrcSet="ps_system_laser_axi_regs_0_0" Part="xc7z020clg400-2" ConstrsSet="ps_system_laser_axi_regs_0_0" Description="Vivado Synthesis Defaults" AutoIncrementalCheckpoint="false" WriteIncrSynthDcp="false" Dir="$PRUNDIR/ps_system_laser_axi_regs_0_0_synth_1" IncludeInArchive="true">
       <Strategy Version="1" Minor="2">
-        <StratHandle Name="Vivado Synthesis Defaults" Flow="Vivado Synthesis 2018">
-          <Desc>Vivado Synthesis Defaults</Desc>
-        </StratHandle>
+        <StratHandle Name="Vivado Synthesis Defaults" Flow="Vivado Synthesis 2018"/>
         <Step Id="synth_design"/>
       </Strategy>
       <GeneratedRun Dir="$PRUNDIR" File="gen_run.xml"/>
@@ -584,9 +570,7 @@
     </Run>
     <Run Id="ps_system_pl_capture_logic_0_0_impl_1" Type="Ft2:EntireDesign" Part="xc7z020clg400-2" ConstrsSet="ps_system_pl_capture_logic_0_0" Description="Default settings for Implementation." AutoIncrementalCheckpoint="false" WriteIncrSynthDcp="false" SynthRun="ps_system_pl_capture_logic_0_0_synth_1" IncludeInArchive="false" GenFullBitstream="true">
       <Strategy Version="1" Minor="2">
-        <StratHandle Name="Vivado Implementation Defaults" Flow="Vivado Implementation 2018">
-          <Desc>Default settings for Implementation.</Desc>
-        </StratHandle>
+        <StratHandle Name="Vivado Implementation Defaults" Flow="Vivado Implementation 2018"/>
         <Step Id="init_design"/>
         <Step Id="opt_design"/>
         <Step Id="power_opt_design"/>
@@ -602,9 +586,7 @@
     </Run>
     <Run Id="ps_system_laser_axi_regs_0_0_impl_1" Type="Ft2:EntireDesign" Part="xc7z020clg400-2" ConstrsSet="ps_system_laser_axi_regs_0_0" Description="Default settings for Implementation." AutoIncrementalCheckpoint="false" WriteIncrSynthDcp="false" SynthRun="ps_system_laser_axi_regs_0_0_synth_1" IncludeInArchive="false" GenFullBitstream="true">
       <Strategy Version="1" Minor="2">
-        <StratHandle Name="Vivado Implementation Defaults" Flow="Vivado Implementation 2018">
-          <Desc>Default settings for Implementation.</Desc>
-        </StratHandle>
+        <StratHandle Name="Vivado Implementation Defaults" Flow="Vivado Implementation 2018"/>
         <Step Id="init_design"/>
         <Step Id="opt_design"/>
         <Step Id="power_opt_design"/>

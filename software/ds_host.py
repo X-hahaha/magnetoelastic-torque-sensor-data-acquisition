@@ -160,6 +160,7 @@ class CaptureFrame:
 
     sensor_total_chunks: Optional[int] = None
     sensor_total_records: Optional[int] = None
+    sensor_total_samples: Optional[int] = None
     sensor_records_bytes: Optional[bytearray] = None
     sensor_received: set = field(default_factory=set)
     sensor_chunk_record_counts: Dict[int, int] = field(default_factory=dict)
@@ -192,6 +193,12 @@ class CaptureFrame:
         payload = data[header_len:]
         expected_len = count * 4
         if len(payload) != expected_len:
+            self.stats.wave_bad_packets += 1
+            return
+        if not (1 <= total_samples <= ADC_SAMPLE_COUNT and 1 <= total_chunks <= total_samples):
+            self.stats.wave_bad_packets += 1
+            return
+        if self.sensor_total_samples is not None and total_samples != self.sensor_total_samples:
             self.stats.wave_bad_packets += 1
             return
 
@@ -251,7 +258,12 @@ class CaptureFrame:
         if len(payload) != expected_len:
             self.stats.sensor_bad_packets += 1
             return
-        if total_samples != ADC_SAMPLE_COUNT:
+        # Short calibration frames carry LS32 too. Its sample count must match
+        # this frame, not the maximum (long-frame) acquisition length.
+        if not (1 <= total_samples <= ADC_SAMPLE_COUNT):
+            self.stats.sensor_bad_packets += 1
+            return
+        if self.wave_total_samples is not None and total_samples != self.wave_total_samples:
             self.stats.sensor_bad_packets += 1
             return
 
@@ -263,8 +275,11 @@ class CaptureFrame:
         if self.sensor_total_chunks is None:
             self.sensor_total_chunks = total_chunks
             self.sensor_total_records = total_records
+            self.sensor_total_samples = total_samples
             self.sensor_records_bytes = bytearray(total_records * LS32_RECORD_BYTES)
-        elif self.sensor_total_chunks != total_chunks or self.sensor_total_records != total_records:
+        elif (self.sensor_total_chunks != total_chunks
+              or self.sensor_total_records != total_records
+              or self.sensor_total_samples != total_samples):
             self.stats.sensor_bad_packets += 1
             return
 
@@ -319,14 +334,25 @@ class CaptureFrame:
         return self.summary_received
 
     def all_expected_chunks_received(self) -> bool:
+        # Called in the packet loop: use O(1) counters, never build missing-index
+        # lists here. Packet acceptance bounds and deduplicates chunk indices.
         wave_ok = (
             self.wave_total_chunks is not None
-            and len(self.wave_received) >= self.wave_total_chunks
+            and len(self.wave_received) == self.wave_total_chunks
         )
         sensor_ok = (
             self.sensor_total_chunks is not None
-            and len(self.sensor_received) >= self.sensor_total_chunks
+            and len(self.sensor_received) == self.sensor_total_chunks
         )
+        if self.summary_received:
+            try:
+                expected_records = int(self.summary["ls_count"])
+            except (KeyError, ValueError):
+                return False
+            if expected_records == 0:
+                sensor_ok = self.sensor_total_records in (None, 0)
+            else:
+                sensor_ok = sensor_ok and self.sensor_total_records == expected_records
         return wave_ok and sensor_ok
 
     def has_payload(self) -> bool:
@@ -426,6 +452,7 @@ class CaptureFrame:
                 "duplicate_chunks": self.stats.sensor_duplicates,
                 "bad_packets": self.stats.sensor_bad_packets,
                 "total_records": self.sensor_total_records,
+                "total_samples": self.sensor_total_samples,
             },
             "summary": self.summary,
             "packet_stats": self.stats.__dict__,

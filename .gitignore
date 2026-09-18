@@ -58,6 +58,7 @@ log/
 software/captures/
 
 # 临时遗留文件夹
+DS_system/DS_system.srcs/sources_1/imports/legacy/
 新建文件夹/
 
 # Vivado Block Design generated outputs (只保留 ps_system.bd，其余均可由 Generate Output Products 重建)
