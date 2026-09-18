@@ -416,25 +416,84 @@ python .\ds_host.py --board-ip 192.168.1.10 auto-stop
 
 ### 5. Vivado 工程复现
 
-当前提交的 `DS_system.srcs/sources_1/bd/ps_system/ps_system.bd` 已经保存最终 M3 连接，包括 `laser_axi_regs_0/sample_count_cfg → pl_capture_logic_0/sample_count_cfg`，并已由 `DS_system.xpr` 直接引用。正常打开或重新生成当前工程时，不需要重复执行 `m0_m1_apply_bd.tcl`、`m2_apply_bd.tcl` 或 `m3_apply_bd.tcl`。只有从旧版本 BD 重新迁移、当前 BD 连接损坏，或明确需要重建对应阶段时，才按 `m0_m1_apply_bd.tcl → m2_apply_bd.tcl → m3_apply_bd.tcl` 的顺序执行。
+仓库已经跟踪 `DS_system.xpr`、最终版 `ps_system.bd` 和 `ps_system_wrapper.v`。其中 `ps_system.bd` 已保存最终 M3 连接，包括 `laser_axi_regs_0/sample_count_cfg → pl_capture_logic_0/sample_count_cfg`，并由 `DS_system.xpr` 直接引用；正常克隆和打开当前工程时，不需要重复执行 `m0_m1_apply_bd.tcl`、`m2_apply_bd.tcl` 或 `m3_apply_bd.tcl`。这三个脚本仅用于从旧版 BD 迁移、修复损坏连接或明确重建对应阶段，此时才按 `m0_m1_apply_bd.tcl → m2_apply_bd.tcl → m3_apply_bd.tcl` 的顺序执行。
 
-在 Vivado 2018.3 Tcl Console 中切换到包含 `DS_system.xpr` 的目录，直接打开当前工程：
+克隆仓库后，在 Vivado 2018.3 中打开 `DS_system/DS_system.xpr`。也可以在 Tcl Console 中切换到该文件所在目录后执行：
 
 ```tcl
 open_project DS_system.xpr
-open_bd_design DS_system.srcs/sources_1/bd/ps_system/ps_system.bd
+open_bd_design [get_files ps_system.bd]
 validate_bd_design
 ```
 
-验证通过后，按常规流程生成 Block Design 输出产品、综合、实现和 bitstream，再导出包含 bitstream 的硬件平台供 SDK 使用。
+`ps_system.bd` 会随仓库提供，但其 IP output products、综合/实现运行目录和 bitstream 属于可再生文件，不进入 Git。第一次打开新克隆时，按以下顺序重建：
+
+1. 在 Sources 中打开 `ps_system.bd`，执行 **Validate Design**。
+2. 右键 `ps_system.bd`，选择 **Generate Output Products → Global**。若 Vivado 提示缺少 BD 下的 `.xci` 或 run 文件，这是生成产物尚未重建，不代表 `ps_system.bd` 缺失。
+3. `ps_system_wrapper.v` 已随仓库提供，正常情况下无需重新创建；仅当 wrapper 确实丢失时，才对 `ps_system.bd` 执行 **Create HDL Wrapper → Let Vivado manage wrapper**。
+4. 执行 **Generate Bitstream**，等待综合、实现和 bitstream 全部成功。
+5. 选择 **File → Export → Export Hardware**，勾选 **Include bitstream** 并允许覆盖旧硬件平台。
+6. 选择 **File → Launch SDK**，SDK workspace 使用当前工程的 `DS_system/DS_system.sdk` 目录。
+
+生成过程中 Vivado 可能更新 `DS_system.xpr`、`ps_system.bd` 或 wrapper。提交前应使用 `git diff` 核对这些变化，只提交确实由设计修改产生的内容，不提交 `.runs`、`.cache`、BD IP output products、bitstream 或 SDK 编译产物。
 
 ### 6. PS 应用编译与下载
 
-1. 在 vivado2018.3 中launch SDK
-2. 重新生成 `DS_system.sdk/DS_System_PS_bsp`，确保 BSP 与最新硬件平台一致。
-3. 编译 `DS_system.sdk/DS_System_PS`；如启动流程需要，同时编译 `FSBL`。
-4. 将新 bitstream 和 PS ELF 下载到板卡，然后重新执行 `ping` 和 `status` 检查。
-5. PS 程序重新启动后通道校准状态不会保留，应先在 GUI 中重新完成通道校准，再进入 L2 自动模式和扭矩模型标定。
+仓库只跟踪 `DS_system.sdk/DS_System_PS` 的工程定义和应用源码；`.metadata`、硬件平台目录、`DS_System_PS_bsp`、`FSBL`、`Debug` 和 ELF 都是本机生成产物。因此新克隆第一次 Launch SDK 后，左侧只有 `ps_system_wrapper_hw_platform_0`，需要按下面的顺序恢复软件工程。
+
+#### 6.1 重建 BSP
+
+选择 **File → New → Board Support Package**，填写：
+
+- Project name：`DS_System_PS_bsp`，名称必须完全一致，因为现有应用工程引用了该名称。
+- Hardware Platform：`ps_system_wrapper_hw_platform_0`。
+- CPU：`ps7_cortexa9_0`。
+- OS：`standalone`。
+
+在 **Board Support Package Settings** 中启用 `lwip202` 和 `xilffs`，并确认 `stdin`、`stdout` 均为 `ps7_uart_1`。其中 `lwip202` 是应用链接 `liblwip4` 所必需的，`xilffs` 用于生成文件系统。
+
+#### 6.2 导入已有应用
+
+不要新建一个空的 `DS_System_PS`。选择 **File → Import → General → Existing Projects into Workspace**，将 root directory 指向当前克隆中的 `DS_system/DS_system.sdk`，勾选已有的 `DS_System_PS`，取消 **Copy projects into workspace** 后完成导入。此时 Project Explorer 应同时出现：
+
+```text
+DS_System_PS
+DS_System_PS_bsp
+ps_system_wrapper_hw_platform_0
+```
+
+#### 6.3 重新生成 BSP 并恢复 lwIP 补丁
+
+右键 `DS_System_PS_bsp` 执行 **Regenerate BSP Sources**。该操作会把 Xilinx 原版 `xadapter.c` 写回 BSP，因此每次重新生成 BSP 后，都要在仓库的 `DS_system` 目录执行：
+
+```powershell
+cd .\DS_system
+python .\tools\reapply_m2_link_fix.py
+```
+
+脚本用于恢复以太网链路重连时的非阻塞处理，避免原版自动协商流程阻塞数秒并影响 FR16 DMA 描述符回收。脚本输出 `patched: ...` 或 `nonblocking link patch already present` 都表示处理成功。随后回到 SDK，依次清理并编译 `DS_System_PS_bsp`，将 `DS_System_PS` 的活动配置设为 **Debug**，再清理并编译应用。编译成功后应生成：
+
+```text
+DS_system.sdk/DS_System_PS/Debug/DS_System_PS.elf
+```
+
+
+#### 6.4 JTAG 下载与验证
+
+连接板卡电源、JTAG、串口和网线后，推荐先通过 JTAG 验证：
+
+1. 选择 **Xilinx → Program FPGA**，确认使用硬件平台中的 `ps_system_wrapper.bit` 后执行 Program。
+2. 右键 `DS_System_PS`，选择 **Run As → Launch on Hardware (System Debugger)**，将 `DS_System_PS.elf` 下载到 `ps7_cortexa9_0` 运行。
+3. JTAG 调试下载不需要 FSBL；只有制作 SD 卡或 QSPI 上电自启动的 `BOOT.bin` 时，才需要另外重建和编译 FSBL。
+4. 串口通常使用 `115200, 8N1`。程序正常启动后应输出 `FR16 DMA ready`、`UDP application started` 等信息。
+5. 将 PC 有线网卡设为 `192.168.1.100/24`，然后在 `software` 目录验证板端：
+
+```powershell
+python .\ds_host.py --board-ip 192.168.1.10 ping
+python .\ds_host.py --board-ip 192.168.1.10 status
+```
+
+`ping` 收到 `#PONG` 且 `status` 能返回 DMA/采集状态，即表示 bitstream、硬件平台、BSP、PS ELF 和网络链路已经完整复现。PS 程序每次重新启动后，RAM 中的通道校准状态不会保留；进入 L2 自动模式或扭矩模型标定前，应先在 GUI 中重新完成通道校准。
 
 ---
 
